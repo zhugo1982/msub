@@ -1,0 +1,1680 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+msub - 订阅合并工具
+把多台 VPS 的节点 / 订阅合并成一组订阅链接（通用订阅、sing-box、Clash）并生成二维码。
+
+来源有两种:
+  1. 其他 VPS 的订阅地址（推荐，来源更新后自动同步；Hugo 脚本的地址能完整带上 ShadowTLS）
+  2. 直接粘贴的节点链接（vless / vmess / trojan / ss / hysteria2 / tuic / anytls / socks）
+
+只依赖 python3；二维码需要 qrencode（会自动安装）。
+"""
+import base64
+import copy
+import http.server
+import json
+import os
+import re
+import shutil
+import socket
+import socketserver
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.0"
+# 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
+# CHANGELOG-BEGIN
+# 1.0.0  首个版本：合并多台 VPS 的订阅/节点，输出通用订阅、sing-box、Clash，并生成二维码
+# CHANGELOG-END
+
+# 脚本升级地址（改成你自己 GitHub 仓库里这个文件的原始地址）
+SCRIPT_URL = "https://raw.githubusercontent.com/zhugo1982/msub/refs/heads/main/msub.py"
+
+BIN_PATH = "/usr/local/bin/msub"
+BASE = "/etc/hugo-merge"
+CFG_FILE = BASE + "/config.json"
+SRC_FILE = BASE + "/sources.json"
+REPORT_FILE = BASE + "/report.json"
+CACHE_DIR = BASE + "/cache"
+OUT_DIR = BASE + "/out"
+DEFAULT_PORT = 2095
+LINE = "=" * 60
+
+WEB_UNIT = "/etc/systemd/system/msub-web.service"
+REFRESH_UNIT = "/etc/systemd/system/msub-refresh.service"
+TIMER_UNIT = "/etc/systemd/system/msub-refresh.timer"
+
+SUPPORTED = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "anytls", "socks"}
+
+
+# ============================================================
+#  通用工具
+# ============================================================
+
+def die(msg, code=1):
+    print(msg)
+    sys.exit(code)
+
+
+def need_root():
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        die("❌ 请使用 root 权限运行（例如: sudo msub）")
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_atomic(path, data, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def write_json(path, obj, mode=0o600):
+    write_atomic(path, json.dumps(obj, ensure_ascii=False, indent=2), mode)
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, **kw)
+    except FileNotFoundError:
+        return None
+
+
+def sc(*args):
+    """systemctl 封装，没有 systemctl 时静默返回 None"""
+    if not shutil.which("systemctl"):
+        return None
+    return run(["systemctl"] + list(args))
+
+
+def b64d(s):
+    s = s.strip().replace("\n", "").replace("\r", "")
+    s = s.replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def b64e(b):
+    return base64.b64encode(b).decode()
+
+
+def b64u(s):
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode().rstrip("=")
+
+
+def quote(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def ver_tuple(v):
+    out = []
+    for p in re.split(r"[.\-]", v):
+        out.append(int(p) if p.isdigit() else 0)
+    return tuple(out)
+
+
+def get_public_ip():
+    for u in ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://ifconfig.me"):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "msub"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                ip = r.read().decode().strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                return ip
+        except Exception:
+            continue
+    return ""
+
+
+def port_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def open_firewall(port):
+    if shutil.which("ufw"):
+        r = run(["ufw", "status"])
+        if r and "Status: active" in r.stdout:
+            run(["ufw", "allow", "%d/tcp" % port])
+            return
+    if shutil.which("firewall-cmd"):
+        r = sc("is-active", "firewalld")
+        if r and r.stdout.strip() == "active":
+            run(["firewall-cmd", "--permanent", "--add-port=%d/tcp" % port])
+            run(["firewall-cmd", "--reload"])
+
+
+def close_firewall(port):
+    if shutil.which("ufw"):
+        r = run(["ufw", "status"])
+        if r and "Status: active" in r.stdout:
+            run(["ufw", "delete", "allow", "%d/tcp" % port])
+            return
+    if shutil.which("firewall-cmd"):
+        r = sc("is-active", "firewalld")
+        if r and r.stdout.strip() == "active":
+            run(["firewall-cmd", "--permanent", "--remove-port=%d/tcp" % port])
+            run(["firewall-cmd", "--reload"])
+
+
+# ============================================================
+#  配置 / 来源存取
+# ============================================================
+
+def load_cfg():
+    return read_json(CFG_FILE, {})
+
+
+def save_cfg(cfg):
+    write_json(CFG_FILE, cfg)
+
+
+def load_sources():
+    return read_json(SRC_FILE, [])
+
+
+def save_sources(src):
+    write_json(SRC_FILE, src)
+
+
+def base_url(cfg):
+    return "http://%s:%s/%s" % (cfg.get("ip", "你的IP"), cfg.get("port"), cfg.get("token"))
+
+
+# ============================================================
+#  节点链接解析  ->  sing-box 出站字典
+# ============================================================
+
+def _split(line):
+    u = urllib.parse.urlsplit(line)
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    name = urllib.parse.unquote(u.fragment)
+    return u, qs, name
+
+
+def _q(qs, k, d=""):
+    v = qs.get(k)
+    return v[0] if v else d
+
+
+def _truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def _tls_from_qs(qs, default_enabled=True):
+    tls = {"enabled": default_enabled}
+    sni = _q(qs, "sni") or _q(qs, "peer") or _q(qs, "servername")
+    if sni:
+        tls["server_name"] = sni
+    fp = _q(qs, "fp")
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    if (_truthy(_q(qs, "allowInsecure")) or _truthy(_q(qs, "insecure"))
+            or _truthy(_q(qs, "allow_insecure")) or _truthy(_q(qs, "skip-cert-verify"))):
+        tls["insecure"] = True
+    alpn = _q(qs, "alpn")
+    if alpn:
+        tls["alpn"] = [a for a in alpn.split(",") if a]
+    return tls
+
+
+def _transport_from_qs(qs):
+    t = _q(qs, "type", "tcp").lower()
+    if t == "grpc":
+        return {"type": "grpc", "service_name": _q(qs, "serviceName")}
+    if t == "ws":
+        tr = {"type": "ws", "path": _q(qs, "path", "/") or "/"}
+        host = _q(qs, "host")
+        if host:
+            tr["headers"] = {"Host": host}
+        return tr
+    return None
+
+
+def _hostport(u, default_port):
+    if not u.hostname:
+        raise ValueError("链接里没有服务器地址")
+    try:
+        port = u.port or default_port
+    except ValueError:
+        raise ValueError("端口格式不正确")
+    return u.hostname, int(port)
+
+
+def p_vless(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("vless 链接缺少 UUID")
+    out = {"type": "vless", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "uuid": urllib.parse.unquote(u.username)}
+    flow = _q(qs, "flow")
+    if flow:
+        out["flow"] = flow
+    sec = _q(qs, "security", "none").lower()
+    if sec in ("tls", "reality"):
+        tls = _tls_from_qs(qs)
+        if sec == "reality":
+            tls["reality"] = {"enabled": True, "public_key": _q(qs, "pbk"), "short_id": _q(qs, "sid")}
+            if "utls" not in tls:
+                tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+        out["tls"] = tls
+    tr = _transport_from_qs(qs)
+    if tr:
+        out["transport"] = tr
+    return out
+
+
+def p_vmess(line):
+    raw = line.split("://", 1)[1].split("#", 1)[0]
+    try:
+        j = json.loads(b64d(raw).decode("utf-8", "ignore"))
+    except Exception:
+        raise ValueError("vmess 链接无法解析")
+    if not j.get("add") or not j.get("id"):
+        raise ValueError("vmess 链接缺少地址或 UUID")
+    out = {"type": "vmess", "tag": j.get("ps") or "%s:%s" % (j["add"], j.get("port")),
+           "server": j["add"], "server_port": int(j.get("port") or 443), "uuid": j["id"],
+           "security": j.get("scy") or "auto", "alter_id": int(j.get("aid") or 0)}
+    if str(j.get("tls", "")).lower() in ("tls", "1", "true"):
+        tls = {"enabled": True}
+        sni = j.get("sni") or j.get("host")
+        if sni:
+            tls["server_name"] = sni
+        if j.get("alpn"):
+            tls["alpn"] = [a for a in str(j["alpn"]).split(",") if a]
+        out["tls"] = tls
+    net = (j.get("net") or "tcp").lower()
+    if net == "ws":
+        tr = {"type": "ws", "path": j.get("path") or "/"}
+        if j.get("host"):
+            tr["headers"] = {"Host": j["host"]}
+        out["transport"] = tr
+    elif net == "grpc":
+        out["transport"] = {"type": "grpc", "service_name": j.get("path") or ""}
+    return out
+
+
+def p_trojan(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("trojan 链接缺少密码")
+    out = {"type": "trojan", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "password": urllib.parse.unquote(u.username),
+           "tls": _tls_from_qs(qs)}
+    tr = _transport_from_qs(qs)
+    if tr:
+        out["transport"] = tr
+    return out
+
+
+def p_ss(line):
+    body = line.split("://", 1)[1]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = urllib.parse.unquote(frag)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+    if "plugin=" in query:
+        raise ValueError("带插件的 ss 链接暂不支持（ShadowTLS 请添加那台 VPS 的订阅地址）")
+    body = body.rstrip("/")
+    try:
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            ui = urllib.parse.unquote(userinfo)
+            if ":" not in ui:
+                ui = b64d(userinfo).decode("utf-8")
+            method, password = ui.split(":", 1)
+        else:
+            dec = b64d(body).decode("utf-8")
+            userinfo, hostport = dec.rsplit("@", 1)
+            method, password = userinfo.split(":", 1)
+        host, port = hostport.rsplit(":", 1)
+        host = host.strip("[]")
+        port = int(port)
+    except Exception:
+        raise ValueError("ss 链接无法解析")
+    return {"type": "shadowsocks", "tag": name or "%s:%s" % (host, port), "server": host,
+            "server_port": port, "method": method, "password": password}
+
+
+def p_hy2(line):
+    if line.lower().startswith("hy2://"):
+        line = "hysteria2://" + line[6:]
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    pw = urllib.parse.unquote(u.username or "")
+    if u.password is not None:
+        pw = pw + ":" + urllib.parse.unquote(u.password)
+    if not pw:
+        raise ValueError("hysteria2 链接缺少密码")
+    out = {"type": "hysteria2", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "password": pw, "tls": _tls_from_qs(qs)}
+    if _q(qs, "obfs"):
+        out["obfs"] = {"type": _q(qs, "obfs"), "password": _q(qs, "obfs-password")}
+    return out
+
+
+def p_tuic(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username or u.password is None:
+        raise ValueError("tuic 链接缺少 UUID 或密码")
+    tls = _tls_from_qs(qs)
+    if "alpn" not in tls:
+        tls["alpn"] = ["h3"]
+    out = {"type": "tuic", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "uuid": urllib.parse.unquote(u.username),
+           "password": urllib.parse.unquote(u.password),
+           "congestion_control": _q(qs, "congestion_control", "bbr"), "tls": tls}
+    mode = _q(qs, "udp_relay_mode")
+    if mode:
+        out["udp_relay_mode"] = mode
+    return out
+
+
+def p_anytls(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("anytls 链接缺少密码")
+    return {"type": "anytls", "tag": name or "%s:%s" % (host, port), "server": host,
+            "server_port": port, "password": urllib.parse.unquote(u.username),
+            "tls": _tls_from_qs(qs)}
+
+
+def p_socks(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 1080)
+    user = pw = ""
+    if u.password is not None:
+        user = urllib.parse.unquote(u.username or "")
+        pw = urllib.parse.unquote(u.password)
+    elif u.username:
+        try:
+            dec = b64d(u.username).decode("utf-8")
+            if ":" in dec:
+                user, pw = dec.split(":", 1)
+            else:
+                user = urllib.parse.unquote(u.username)
+        except Exception:
+            user = urllib.parse.unquote(u.username)
+    out = {"type": "socks", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port}
+    if user:
+        out["username"] = user
+        out["password"] = pw
+    return out
+
+
+PARSERS = {
+    "vless": p_vless, "vmess": p_vmess, "trojan": p_trojan, "ss": p_ss,
+    "hysteria2": p_hy2, "hy2": p_hy2, "tuic": p_tuic, "anytls": p_anytls,
+    "socks": p_socks, "socks5": p_socks,
+}
+
+
+def parse_link(line):
+    line = line.strip()
+    if "://" not in line:
+        raise ValueError("不是节点链接")
+    scheme = line.split("://", 1)[0].lower()
+    fn = PARSERS.get(scheme)
+    if not fn:
+        raise ValueError("暂不支持的协议: %s" % scheme)
+    return fn(line)
+
+
+# ============================================================
+#  节点结构:  {"out": sing-box 出站, "helpers": [辅助出站, 如 shadowtls]}
+# ============================================================
+
+def nodes_from_singbox_json(text):
+    j = json.loads(text)
+    obs = j.get("outbounds") or []
+    by_tag = {o.get("tag"): o for o in obs}
+    nodes = []
+    for o in obs:
+        if o.get("type") not in SUPPORTED:
+            continue
+        node = {"out": copy.deepcopy(o), "helpers": []}
+        d = o.get("detour")
+        if d:
+            t = by_tag.get(d)
+            if t and t.get("type") == "shadowtls":
+                node["helpers"].append(copy.deepcopy(t))
+            else:
+                node["out"].pop("detour", None)
+        nodes.append(node)
+    return nodes
+
+
+def extract_lines(text):
+    t = text.strip()
+    if "://" not in t[:300]:
+        try:
+            dec = b64d(t).decode("utf-8", "ignore")
+            if "://" in dec:
+                t = dec
+        except Exception:
+            pass
+    return [l.strip() for l in t.replace("\r", "").split("\n")
+            if l.strip() and not l.strip().startswith("#")]
+
+
+def parse_lines(lines):
+    nodes, skipped = [], []
+    for ln in lines:
+        try:
+            nodes.append({"out": parse_link(ln), "helpers": []})
+        except (ValueError, KeyError, TypeError) as e:
+            skipped.append((ln[:50] + ("…" if len(ln) > 50 else ""), str(e)))
+    return nodes, skipped
+
+
+def parse_content(text):
+    t = text.strip()
+    if t.startswith("{"):
+        try:
+            return nodes_from_singbox_json(t), []
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return parse_lines(extract_lines(t))
+
+
+HUGO_RE = re.compile(r"^(https?://[^/]+/[0-9a-f]{16})/(sub|singbox|singbox-cn|clash)/?$")
+
+
+def candidate_urls(url):
+    m = HUGO_RE.match(url.strip())
+    if m:
+        return [m.group(1) + "/singbox", m.group(1) + "/sub"]
+    return [url.strip()]
+
+
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": "msub/" + VERSION})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(8 * 1024 * 1024)
+    return data.decode("utf-8", "ignore")
+
+
+def fetch_url_nodes(url):
+    """依次尝试候选地址，返回 (节点列表, 实际使用的地址, 跳过列表)"""
+    last_err = None
+    for u in candidate_urls(url):
+        try:
+            text = http_get(u)
+            nodes, skipped = parse_content(text)
+            if nodes:
+                return nodes, u, skipped
+            last_err = "没有解析到可用节点"
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err or "拉取失败")
+
+
+# ============================================================
+#  节点转换: 分享链接 / Clash / sing-box
+# ============================================================
+
+def to_link(node):
+    o = node["out"]
+    if node["helpers"]:
+        return None
+    ty = o["type"]
+    host = o["server"]
+    hp = "[%s]" % host if ":" in host else host
+    port = o["server_port"]
+    tls = o.get("tls") or {}
+    name = quote(o["tag"])
+    tr = o.get("transport") or {}
+    tt = tr.get("type")
+    if tt not in (None, "grpc", "ws"):
+        return None
+
+    def qs_str(pairs):
+        return "&".join("%s=%s" % (k, quote(v)) for k, v in pairs if v not in (None, ""))
+
+    def tr_pairs():
+        if tt == "grpc":
+            return [("type", "grpc"), ("serviceName", tr.get("service_name", "")), ("mode", "gun")]
+        if tt == "ws":
+            return [("type", "ws"), ("path", tr.get("path", "/")), ("host", (tr.get("headers") or {}).get("Host", ""))]
+        return [("type", "tcp")]
+
+    def tls_pairs():
+        pairs = []
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        fp = (tls.get("utls") or {}).get("fingerprint")
+        if fp:
+            pairs.append(("fp", fp))
+        if tls.get("alpn"):
+            pairs.append(("alpn", ",".join(tls["alpn"])))
+        return pairs
+
+    if ty == "vless":
+        pairs = [("encryption", "none")]
+        if o.get("flow"):
+            pairs.append(("flow", o["flow"]))
+        r = tls.get("reality")
+        if r and r.get("enabled"):
+            pairs.append(("security", "reality"))
+            pairs += tls_pairs()
+            pairs += [("pbk", r.get("public_key", "")), ("sid", r.get("short_id", ""))]
+        elif tls.get("enabled"):
+            pairs.append(("security", "tls"))
+            pairs += tls_pairs()
+            if tls.get("insecure"):
+                pairs.append(("allowInsecure", "1"))
+        else:
+            pairs.append(("security", "none"))
+        pairs += tr_pairs()
+        return "vless://%s@%s:%s?%s#%s" % (quote(o["uuid"]), hp, port, qs_str(pairs), name)
+
+    if ty == "vmess":
+        j = {"v": "2", "ps": o["tag"], "add": host, "port": str(port), "id": o["uuid"],
+             "aid": str(o.get("alter_id", 0)), "scy": o.get("security", "auto"),
+             "net": tt or "tcp", "type": "none",
+             "host": (tr.get("headers") or {}).get("Host", ""),
+             "path": tr.get("path", "") if tt == "ws" else tr.get("service_name", "") if tt == "grpc" else "",
+             "tls": "tls" if tls.get("enabled") else "",
+             "sni": tls.get("server_name", "")}
+        return "vmess://" + b64e(json.dumps(j, ensure_ascii=False).encode("utf-8"))
+
+    if ty == "trojan":
+        pairs = [("security", "tls")] + tls_pairs()
+        if tls.get("insecure"):
+            pairs.append(("allowInsecure", "1"))
+        pairs += tr_pairs()
+        return "trojan://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "shadowsocks":
+        return "ss://%s@%s:%s#%s" % (b64u("%s:%s" % (o["method"], o["password"])), hp, port, name)
+
+    if ty == "hysteria2":
+        pairs = []
+        if tls.get("insecure"):
+            pairs.append(("insecure", "1"))
+        pairs += tls_pairs()
+        ob = o.get("obfs")
+        if ob:
+            pairs += [("obfs", ob.get("type", "")), ("obfs-password", ob.get("password", ""))]
+        return "hysteria2://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "tuic":
+        pairs = [("congestion_control", o.get("congestion_control", "bbr"))]
+        if tls.get("alpn"):
+            pairs.append(("alpn", ",".join(tls["alpn"])))
+        if tls.get("insecure"):
+            pairs.append(("allow_insecure", "1"))
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        pairs.append(("udp_relay_mode", o.get("udp_relay_mode", "native")))
+        return "tuic://%s:%s@%s:%s?%s#%s" % (quote(o["uuid"]), quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "anytls":
+        pairs = []
+        if tls.get("insecure"):
+            pairs.append(("insecure", "1"))
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        return "anytls://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "socks":
+        if o.get("username"):
+            return "socks://%s@%s:%s#%s" % (b64u("%s:%s" % (o["username"], o.get("password", ""))), hp, port, name)
+        return "socks://%s:%s#%s" % (hp, port, name)
+    return None
+
+
+def to_clash(node):
+    o = node["out"]
+    ty = o["type"]
+    p = {"name": o["tag"], "type": None, "server": o["server"], "port": o["server_port"]}
+    tls = o.get("tls") or {}
+    tr = o.get("transport") or {}
+    tt = tr.get("type")
+
+    def transport():
+        if tt == "grpc":
+            p["network"] = "grpc"
+            p["grpc-opts"] = {"grpc-service-name": tr.get("service_name", "")}
+        elif tt == "ws":
+            p["network"] = "ws"
+            opts = {"path": tr.get("path", "/")}
+            host = (tr.get("headers") or {}).get("Host")
+            if host:
+                opts["headers"] = {"Host": host}
+            p["ws-opts"] = opts
+        elif tt:
+            return False
+        else:
+            p["network"] = "tcp"
+        return True
+
+    def tls_common(sni_key):
+        if tls.get("server_name"):
+            p[sni_key] = tls["server_name"]
+        if tls.get("insecure"):
+            p["skip-cert-verify"] = True
+        if tls.get("alpn"):
+            p["alpn"] = tls["alpn"]
+        fp = (tls.get("utls") or {}).get("fingerprint")
+        if fp:
+            p["client-fingerprint"] = fp
+
+    if ty == "vless":
+        p.update({"type": "vless", "uuid": o["uuid"], "udp": True})
+        if not transport():
+            return None
+        if o.get("flow"):
+            p["flow"] = o["flow"]
+        if tls.get("enabled"):
+            p["tls"] = True
+            tls_common("servername")
+            r = tls.get("reality")
+            if r and r.get("enabled"):
+                p["reality-opts"] = {"public-key": r.get("public_key", ""), "short-id": r.get("short_id", "")}
+        return p
+
+    if ty == "vmess":
+        p.update({"type": "vmess", "uuid": o["uuid"], "alterId": o.get("alter_id", 0),
+                  "cipher": o.get("security", "auto"), "udp": True})
+        if not transport():
+            return None
+        if tls.get("enabled"):
+            p["tls"] = True
+            tls_common("servername")
+        return p
+
+    if ty == "trojan":
+        p.update({"type": "trojan", "password": o["password"], "udp": True})
+        if not transport():
+            return None
+        tls_common("sni")
+        return p
+
+    if ty == "shadowsocks":
+        p.update({"type": "ss", "cipher": o["method"], "password": o["password"], "udp": True})
+        if node["helpers"]:
+            h = node["helpers"][0]
+            p["server"] = h["server"]
+            p["port"] = h["server_port"]
+            p["plugin"] = "shadow-tls"
+            p["client-fingerprint"] = ((h.get("tls") or {}).get("utls") or {}).get("fingerprint", "chrome")
+            p["plugin-opts"] = {"host": (h.get("tls") or {}).get("server_name", ""),
+                                "password": h.get("password", ""), "version": h.get("version", 3)}
+        return p
+
+    if ty == "hysteria2":
+        p.update({"type": "hysteria2", "password": o["password"]})
+        tls_common("sni")
+        ob = o.get("obfs")
+        if ob:
+            p["obfs"] = ob.get("type", "")
+            p["obfs-password"] = ob.get("password", "")
+        return p
+
+    if ty == "tuic":
+        p.update({"type": "tuic", "uuid": o["uuid"], "password": o["password"],
+                  "congestion-controller": o.get("congestion_control", "bbr"),
+                  "udp-relay-mode": o.get("udp_relay_mode", "native")})
+        tls_common("sni")
+        return p
+
+    if ty == "anytls":
+        p.update({"type": "anytls", "password": o["password"], "udp": True})
+        tls_common("sni")
+        return p
+
+    if ty == "socks":
+        p.update({"type": "socks5", "udp": True})
+        if o.get("username"):
+            p["username"] = o["username"]
+            p["password"] = o.get("password", "")
+        return p
+    return None
+
+
+# ---------- 极简 YAML 输出（不依赖 PyYAML）----------
+
+def y_scalar(v):
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(v, ensure_ascii=False)
+
+
+def y_dump(obj, indent=0):
+    sp = "  " * indent
+    lines = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, dict) and v:
+                lines.append("%s%s:" % (sp, k))
+                lines.extend(y_dump(v, indent + 1))
+            elif isinstance(v, list) and v:
+                lines.append("%s%s:" % (sp, k))
+                lines.extend(y_dump(v, indent + 1))
+            elif isinstance(v, dict):
+                lines.append("%s%s: {}" % (sp, k))
+            elif isinstance(v, list):
+                lines.append("%s%s: []" % (sp, k))
+            else:
+                lines.append("%s%s: %s" % (sp, k, y_scalar(v)))
+    elif isinstance(obj, list):
+        for it in obj:
+            if isinstance(it, dict) and it:
+                sub = y_dump(it, indent + 1)
+                lines.append("%s- %s" % (sp, sub[0][len(sp) + 2:]))
+                lines.extend(sub[1:])
+            else:
+                lines.append("%s- %s" % (sp, y_scalar(it)))
+    return lines
+
+
+# ---------- 节点分组辅助 ----------
+
+def is_auto_candidate(node):
+    return node["out"]["type"] != "socks" and not node["helpers"]
+
+
+def source_groups(nodes):
+    """按来源汇总节点，保持出现顺序: {来源名: [node,...]}"""
+    g = {}
+    for n in nodes:
+        g.setdefault(n["source"], []).append(n)
+    return g
+
+
+def build_clash(nodes, cfg):
+    proxies, kept = [], []
+    for n in nodes:
+        c = to_clash(n)
+        if c:
+            proxies.append(c)
+            kept.append(n)
+    names = [p["name"] for p in proxies]
+    cand = [n["out"]["tag"] for n in kept if is_auto_candidate(n)]
+    groups = source_groups(kept)
+    multi = len(groups) > 1
+
+    sel = ["自动选择"] if cand else []
+    pgroups = []
+    if cand:
+        pgroups.append({"name": "自动选择", "type": "url-test", "url": "https://www.gstatic.com/generate_204",
+                        "interval": 300, "tolerance": 50, "proxies": cand})
+    if multi:
+        for src, ns in groups.items():
+            c2 = [n["out"]["tag"] for n in ns if is_auto_candidate(n)]
+            if c2:
+                gname = "自动-%s" % src
+                pgroups.append({"name": gname, "type": "url-test", "url": "https://www.gstatic.com/generate_204",
+                                "interval": 300, "tolerance": 50, "proxies": c2})
+                sel.append(gname)
+    pgroups.insert(0, {"name": "节点选择", "type": "select", "proxies": sel + names + ["DIRECT"]})
+
+    rules = []
+    if cfg.get("ip") and cfg.get("port"):
+        rules.append("AND,((IP-CIDR,%s/32),(DST-PORT,%s)),DIRECT" % (cfg["ip"], cfg["port"]))
+    rules += ["GEOIP,LAN,DIRECT,no-resolve", "GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT", "MATCH,节点选择"]
+
+    doc = {
+        "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "warning", "ipv6": False,
+        "dns": {"enable": True, "ipv6": False, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
+                "nameserver": ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]},
+        "proxies": proxies, "proxy-groups": pgroups, "rules": rules,
+    }
+    return "\n".join(y_dump(doc)) + "\n"
+
+
+def build_singbox(nodes, cfg, cn=False):
+    outs, tags = [], []
+    for n in nodes:
+        outs.append(copy.deepcopy(n["out"]))
+        outs.extend(copy.deepcopy(h) for h in n["helpers"])
+        tags.append(n["out"]["tag"])
+    cand = [n["out"]["tag"] for n in nodes if is_auto_candidate(n)]
+    groups = source_groups(nodes)
+    multi = len(groups) > 1
+
+    sel = []
+    group_outs = []
+    if cand:
+        group_outs.append({"type": "urltest", "tag": "auto", "outbounds": cand,
+                           "url": "https://www.gstatic.com/generate_204", "interval": "5m"})
+        sel.append("auto")
+    if multi:
+        for src, ns in groups.items():
+            c2 = [n["out"]["tag"] for n in ns if is_auto_candidate(n)]
+            if c2:
+                gt = "auto-%s" % src
+                group_outs.append({"type": "urltest", "tag": gt, "outbounds": c2,
+                                   "url": "https://www.gstatic.com/generate_204", "interval": "5m"})
+                sel.append(gt)
+    selector = {"type": "selector", "tag": "proxy", "outbounds": sel + tags}
+    if sel:
+        selector["default"] = sel[0]
+
+    rules = [{"action": "sniff"}, {"protocol": "dns", "action": "hijack-dns"}]
+    if cfg.get("ip") and cfg.get("port"):
+        rules.append({"ip_cidr": ["%s/32" % cfg["ip"]], "port": [int(cfg["port"])],
+                      "action": "route", "outbound": "direct"})
+    rules.append({"ip_is_private": True, "action": "route", "outbound": "direct"})
+
+    doc = {
+        "log": {"level": "warn"},
+        "dns": {"servers": [{"type": "https", "tag": "dns-remote", "server": "1.1.1.1", "detour": "proxy"},
+                            {"type": "udp", "tag": "dns-local", "server": "223.5.5.5"}],
+                "final": "dns-remote"},
+        "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"], "auto_route": True}],
+        "outbounds": [selector] + group_outs + outs + [{"type": "direct", "tag": "direct"}],
+        "route": {"rules": rules, "final": "proxy", "auto_detect_interface": True,
+                  "default_domain_resolver": "dns-local"},
+    }
+    if cn:
+        doc["http_clients"] = [{"tag": "proxy-http", "detour": "proxy"}]
+        doc["route"]["default_http_client"] = "proxy-http"
+        doc["route"]["rule_set"] = [
+            {"tag": "geoip-cn", "type": "remote", "format": "binary",
+             "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"},
+            {"tag": "geosite-cn", "type": "remote", "format": "binary",
+             "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"},
+        ]
+        doc["route"]["rules"].append({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"})
+        doc["dns"]["rules"] = [{"rule_set": "geosite-cn", "action": "route", "server": "dns-local"}]
+    return json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+#  刷新: 拉取所有来源 -> 去重改名 -> 生成输出文件
+# ============================================================
+
+def node_key(n):
+    """去重用的身份标识：只看服务器、端口、凭证等，忽略名字和默认值差异"""
+    o = n["out"]
+    t = o.get("tls") or {}
+    r = t.get("reality") or {}
+    tr = o.get("transport") or {}
+    ident = [o["type"], str(o["server"]).lower(), o["server_port"], o.get("uuid"), o.get("password"),
+             o.get("username"), o.get("method"), r.get("public_key"), tr.get("type"),
+             tr.get("service_name") or tr.get("path")]
+    hs = [[h.get("server"), h.get("server_port"), h.get("password")] for h in n["helpers"]]
+    return json.dumps([ident, hs], ensure_ascii=False)
+
+
+def uniq(tag, seen):
+    base, i = tag, 2
+    while tag in seen:
+        tag = "%s-%d" % (base, i)
+        i += 1
+    seen.add(tag)
+    return tag
+
+
+def retag(node, prefix, seen):
+    old = node["out"]["tag"]
+    base = old[5:] if old.startswith("Hugo-") else old
+    tag = uniq("%s-%s" % (prefix, base) if prefix else base, seen)
+    node["out"]["tag"] = tag
+    for i, h in enumerate(node["helpers"]):
+        h["tag"] = uniq("%s-helper%d" % (tag, i + 1), seen)
+        node["out"]["detour"] = h["tag"]
+
+
+def source_label(s, idx):
+    return s.get("name") or "S%d" % (idx + 1)
+
+
+def collect_nodes():
+    sources = load_sources()
+    allnodes, report = [], {}
+    seen_tags, seen_keys = set(), set()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for idx, s in enumerate(sources):
+        nodes, status = [], "ok"
+        try:
+            if s["type"] == "url":
+                nodes, used, skipped = fetch_url_nodes(s["url"])
+                write_json(os.path.join(CACHE_DIR, s["id"] + ".json"), nodes)
+            else:
+                nodes, skipped = parse_lines(s.get("links", []))
+        except Exception as e:
+            cached = read_json(os.path.join(CACHE_DIR, s["id"] + ".json"), [])
+            if cached:
+                nodes = cached
+                status = "拉取失败(%s)，使用上次缓存" % e
+            else:
+                status = "拉取失败: %s" % e
+        label = source_label(s, idx)
+        kept = []
+        for n in nodes:
+            k = node_key(n)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            retag(n, s.get("name", ""), seen_tags)
+            n["source"] = label
+            kept.append(n)
+        allnodes.extend(kept)
+        report[s["id"]] = {"status": status, "count": len(kept), "tags": [n["out"]["tag"] for n in kept],
+                           "time": int(time.time())}
+    write_json(REPORT_FILE, report)
+    return allnodes, report
+
+
+def render_outputs(nodes, cfg):
+    links = [l for l in (to_link(n) for n in nodes) if l]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    write_atomic(OUT_DIR + "/sub_b64.txt", b64e("\n".join(links).encode("utf-8")))
+    write_atomic(OUT_DIR + "/clash.yaml", build_clash(nodes, cfg))
+    write_atomic(OUT_DIR + "/singbox.json", build_singbox(nodes, cfg, cn=False))
+    write_atomic(OUT_DIR + "/singbox-cn.json", build_singbox(nodes, cfg, cn=True))
+    return len(links)
+
+
+def do_refresh(verbose=True):
+    cfg = load_cfg()
+    if not cfg:
+        die("❌ 尚未初始化，请先运行 msub 完成设置。")
+    nodes, report = collect_nodes()
+    if verbose:
+        sources = load_sources()
+        for idx, s in enumerate(sources):
+            r = report.get(s["id"], {})
+            print("  [%s] %s: %s，节点 %d 个" % (idx + 1, source_label(s, idx), r.get("status"), r.get("count", 0)))
+    if not nodes:
+        if verbose:
+            print("⚠️  当前没有任何可用节点，未更新订阅文件。")
+        return 0
+    n_links = render_outputs(nodes, cfg)
+    if verbose:
+        print("✅ 已合并 %d 个节点（其中 %d 个可用于通用订阅；ShadowTLS 等仅 sing-box / Clash 支持）" % (len(nodes), n_links))
+    return len(nodes)
+
+
+# ============================================================
+#  订阅 Web 服务
+# ============================================================
+
+ROUTES = {
+    "sub": ("sub_b64.txt", "text/plain; charset=utf-8"),
+    "clash": ("clash.yaml", "text/yaml; charset=utf-8"),
+    "singbox": ("singbox.json", "application/json; charset=utf-8"),
+    "singbox-cn": ("singbox-cn.json", "application/json; charset=utf-8"),
+}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        cfg = load_cfg()
+        token = cfg.get("token", "")
+        parts = self.path.split("?")[0].strip("/").split("/")
+        item = None
+        if token and len(parts) == 2 and parts[0] == token:
+            item = ROUTES.get(parts[1])
+        if not item:
+            self.send_error(404, "Not Found")
+            return
+        try:
+            with open(os.path.join(OUT_DIR, item[0]), "rb") as f:
+                data = f.read()
+        except Exception:
+            self.send_error(404, "Not Found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", item[1])
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def do_serve():
+    cfg = load_cfg()
+    if not cfg:
+        die("❌ 尚未初始化。")
+    Server(("", int(cfg["port"])), Handler).serve_forever()
+
+
+# ============================================================
+#  系统服务 / 初始化
+# ============================================================
+
+def write_units(cfg):
+    py = sys.executable or "/usr/bin/python3"
+    write_atomic(WEB_UNIT, """[Unit]
+Description=msub subscription web service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s %s serve
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+""" % (py, BIN_PATH), 0o644)
+    write_atomic(REFRESH_UNIT, """[Unit]
+Description=msub refresh subscriptions
+
+[Service]
+Type=oneshot
+ExecStart=%s %s refresh --quiet
+""" % (py, BIN_PATH), 0o644)
+    write_atomic(TIMER_UNIT, """[Unit]
+Description=msub periodic refresh
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=%sh
+
+[Install]
+WantedBy=timers.target
+""" % cfg.get("interval_hours", 3), 0o644)
+    sc("daemon-reload")
+
+
+def install_self():
+    me = os.path.realpath(sys.argv[0])
+    if me != os.path.realpath(BIN_PATH) and os.path.isfile(me):
+        try:
+            shutil.copy(me, BIN_PATH)
+            os.chmod(BIN_PATH, 0o755)
+        except Exception:
+            pass
+
+
+def setup():
+    need_root()
+    for d in (BASE, CACHE_DIR, OUT_DIR):
+        os.makedirs(d, exist_ok=True)
+    os.chmod(BASE, 0o700)
+    install_self()
+    cfg = load_cfg()
+    first = not cfg
+    if first:
+        print(LINE)
+        print("  首次使用，先做一次初始化")
+        print(LINE)
+        while True:
+            v = input("订阅服务监听端口 [直接回车使用 %d]: " % DEFAULT_PORT).strip() or str(DEFAULT_PORT)
+            if v.isdigit() and 1 <= int(v) <= 65535:
+                if port_free(int(v)):
+                    cfg["port"] = int(v)
+                    break
+                print("❌ 端口 %s 已被占用，请换一个。" % v)
+            else:
+                print("❌ 端口必须是 1-65535 之间的数字。")
+        cfg["token"] = os.urandom(8).hex()
+        cfg["interval_hours"] = 3
+    if not cfg.get("ip"):
+        ip = get_public_ip()
+        if not ip:
+            ip = input("❌ 自动获取公网 IP 失败，请手动输入本机公网 IP: ").strip()
+        cfg["ip"] = ip
+    save_cfg(cfg)
+    write_units(cfg)
+    sc("enable", "msub-web")
+    sc("restart", "msub-web")
+    sc("enable", "--now", "msub-refresh.timer")
+    open_firewall(int(cfg["port"]))
+    if first:
+        print("✅ 初始化完成。订阅服务端口: %s（请在云安全组放行 TCP %s）" % (cfg["port"], cfg["port"]))
+    return cfg
+
+
+def ensure_cfg():
+    cfg = load_cfg()
+    if cfg.get("token") and cfg.get("port"):
+        return cfg
+    return setup()
+
+
+# ============================================================
+#  订阅地址 / 二维码
+# ============================================================
+
+def url_list(cfg):
+    b = base_url(cfg)
+    return [
+        ("通用订阅（小火箭 / V2rayN / v2rayNG / NekoBox）", b + "/sub", b + "/sub"),
+        ("sing-box 苹果端 - 全局代理", b + "/singbox",
+         "sing-box://import-remote-profile?url=%s#Merge-Global" % quote(b + "/singbox")),
+        ("sing-box 苹果端 - 大陆直连分流", b + "/singbox-cn",
+         "sing-box://import-remote-profile?url=%s#Merge-CN" % quote(b + "/singbox-cn")),
+        ("Clash Meta / Mihomo", b + "/clash", b + "/clash"),
+    ]
+
+
+def ensure_qrencode():
+    if shutil.which("qrencode"):
+        return True
+    print("==> 安装二维码工具 qrencode...")
+    if shutil.which("apt-get"):
+        run(["apt-get", "update", "-y"])
+        run(["apt-get", "install", "-y", "qrencode"])
+    elif shutil.which("dnf"):
+        run(["dnf", "install", "-y", "qrencode"])
+    elif shutil.which("yum"):
+        run(["yum", "install", "-y", "qrencode"])
+    return bool(shutil.which("qrencode"))
+
+
+def show_urls(cfg, qr=False, only=None):
+    print(LINE)
+    items = url_list(cfg)
+    if only is not None:
+        items = [items[only]]
+    have_qr = ensure_qrencode() if qr else False
+    for title, url, qrdata in items:
+        print("🔗 %s" % title)
+        print("   %s" % url)
+        if qr:
+            if have_qr:
+                r = run(["qrencode", "-t", "ANSIUTF8", qrdata])
+                if r:
+                    print(r.stdout)
+            else:
+                print("   （未能安装 qrencode，无法显示二维码）")
+        print("")
+    print("⚠️  订阅链接含全部节点密码，请勿公开分享。")
+    print("⚠️  请确认云安全组已放行 TCP %s。" % cfg.get("port"))
+    print(LINE)
+
+
+# ============================================================
+#  交互: 添加 / 查看 / 删除来源
+# ============================================================
+
+def new_id(sources):
+    used = {s["id"] for s in sources}
+    while True:
+        i = os.urandom(3).hex()
+        if i not in used:
+            return i
+
+
+def summarize(nodes):
+    cnt = {}
+    for n in nodes:
+        cnt[n["out"]["type"]] = cnt.get(n["out"]["type"], 0) + 1
+    return "、".join("%s×%d" % (k, v) for k, v in cnt.items())
+
+
+def add_url(url=None, name=None):
+    cfg = ensure_cfg()
+    if not url:
+        print("请输入其他 VPS 的订阅地址（Hugo 脚本的 /sub、/singbox、/clash 地址都可以，会自动取最完整的）：")
+        url = input("订阅地址: ").strip()
+    if not re.match(r"^https?://", url):
+        print("❌ 订阅地址必须以 http:// 或 https:// 开头。")
+        return
+    print("==> 正在拉取并检查...")
+    try:
+        nodes, used, skipped = fetch_url_nodes(url)
+    except Exception as e:
+        print("❌ 拉取失败: %s" % e)
+        return
+    print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+    if used != url.strip():
+        print("   （已自动改用更完整的地址: %s）" % used)
+    for ln, why in skipped:
+        print("   跳过: %s  (%s)" % (ln, why))
+    if name is None:
+        name = input("给这台 VPS 起个名字，用作节点名前缀（如 US、日本；回车则不加前缀）: ").strip()
+    sources = load_sources()
+    if any(s.get("type") == "url" and s.get("url") == url.strip() for s in sources):
+        print("ℹ️  这个订阅地址已经添加过了，将直接刷新。")
+    else:
+        sources.append({"id": new_id(sources), "type": "url", "name": name, "url": url.strip(),
+                        "added": int(time.time())})
+        save_sources(sources)
+    finish_add(cfg)
+
+
+def read_pasted_lines():
+    print("请粘贴节点链接（支持多行，可分多次粘贴）。")
+    print("粘贴完成后，再按一次回车（空行）结束输入：")
+    lines = []
+    while True:
+        try:
+            ln = input()
+        except EOFError:
+            break
+        if not ln.strip():
+            if lines:
+                break
+            continue
+        lines.append(ln.strip())
+    return lines
+
+
+def add_links(lines=None, name=None):
+    cfg = ensure_cfg()
+    if lines is None:
+        lines = read_pasted_lines()
+    expanded = []
+    for ln in lines:
+        if re.match(r"^https?://", ln):
+            print("ℹ️  检测到订阅地址，请用「添加订阅地址」: %s" % ln[:60])
+            continue
+        if "://" in ln:
+            expanded.append(ln)
+        else:
+            expanded.extend(extract_lines(ln))
+    nodes, skipped, good_lines = [], [], []
+    for ln in expanded:
+        n1, s1 = parse_lines([ln])
+        if n1:
+            nodes.extend(n1)
+            good_lines.append(ln)
+        else:
+            skipped.extend(s1)
+    for ln, why in skipped:
+        print("   跳过: %s  (%s)" % (ln, why))
+    if not nodes:
+        print("❌ 没有识别到有效的节点链接。")
+        return
+    print("✅ 识别到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+    if name is None:
+        name = input("给这批节点起个名字，用作节点名前缀（如 US、日本；回车则不加前缀）: ").strip()
+    sources = load_sources()
+    sources.append({"id": new_id(sources), "type": "links", "name": name, "links": good_lines,
+                    "added": int(time.time())})
+    save_sources(sources)
+    finish_add(cfg)
+
+
+def finish_add(cfg):
+    print("==> 正在合并并生成订阅...")
+    if do_refresh() > 0:
+        show_urls(cfg, qr=True)
+
+
+def list_sources():
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    if not sources:
+        print("（还没有添加任何来源）")
+        return
+    print(LINE)
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        kind = "订阅地址" if s["type"] == "url" else "粘贴节点"
+        print("[%d] %s  (%s)  节点 %s 个  状态: %s" % (idx + 1, source_label(s, idx), kind,
+                                                      r.get("count", "?"), r.get("status", "未刷新")))
+        if s["type"] == "url":
+            print("    %s" % s["url"])
+        for t in r.get("tags", []):
+            print("      - %s" % t)
+    print(LINE)
+
+
+def remove_source(arg=None):
+    sources = load_sources()
+    if not sources:
+        print("（还没有添加任何来源）")
+        return
+    list_sources()
+    v = arg if arg else input("请输入要删除的来源编号（0 取消）: ").strip()
+    if not v.isdigit() or int(v) == 0 or int(v) > len(sources):
+        print("❌ 已取消。")
+        return
+    s = sources.pop(int(v) - 1)
+    save_sources(sources)
+    try:
+        os.unlink(os.path.join(CACHE_DIR, s["id"] + ".json"))
+    except Exception:
+        pass
+    print("✅ 已删除来源: %s" % source_label(s, int(v) - 1))
+    do_refresh()
+
+
+# ============================================================
+#  设置 / 状态 / 升级 / 卸载
+# ============================================================
+
+def settings():
+    cfg = ensure_cfg()
+    print(LINE)
+    print("  1. 修改订阅服务端口（当前 %s）" % cfg["port"])
+    print("  2. 修改自动刷新间隔（当前 %s 小时）" % cfg.get("interval_hours", 3))
+    print("  3. 更换订阅 token（所有订阅链接都会变化）")
+    print("  4. 修改服务器 IP（当前 %s）" % cfg.get("ip"))
+    print("  0. 返回")
+    print(LINE)
+    c = input("请选择 [0-4]: ").strip()
+    if c == "1":
+        v = input("新端口: ").strip()
+        if not v.isdigit() or not (1 <= int(v) <= 65535):
+            print("❌ 端口无效。")
+            return
+        if int(v) == int(cfg["port"]):
+            print("❌ 与当前端口相同。")
+            return
+        if not port_free(int(v)):
+            print("❌ 端口已被占用。")
+            return
+        old = int(cfg["port"])
+        cfg["port"] = int(v)
+        save_cfg(cfg)
+        sc("restart", "msub-web")
+        open_firewall(int(v))
+        close_firewall(old)
+        do_refresh(verbose=False)
+        print("✅ 端口已改为 %s，订阅链接已变化，请在云安全组放行新端口。" % v)
+        show_urls(cfg)
+    elif c == "2":
+        v = input("刷新间隔（小时，1-168）: ").strip()
+        if not v.isdigit() or not (1 <= int(v) <= 168):
+            print("❌ 无效。")
+            return
+        cfg["interval_hours"] = int(v)
+        save_cfg(cfg)
+        write_units(cfg)
+        sc("restart", "msub-refresh.timer")
+        print("✅ 已改为每 %s 小时自动刷新。" % v)
+    elif c == "3":
+        cfg["token"] = os.urandom(8).hex()
+        save_cfg(cfg)
+        print("✅ token 已更换，旧订阅链接全部失效，请使用新的链接。")
+        show_urls(cfg)
+    elif c == "4":
+        v = input("新的服务器 IP: ").strip()
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+            print("❌ IP 格式不对。")
+            return
+        cfg["ip"] = v
+        save_cfg(cfg)
+        do_refresh(verbose=False)
+        print("✅ 已更新。")
+
+
+def http_code(url):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return "无法连接(%s)" % e
+
+
+def status():
+    cfg = load_cfg()
+    print(LINE)
+    for u in ("msub-web", "msub-refresh.timer"):
+        r = sc("is-active", u)
+        print("服务 %-20s %s" % (u, r.stdout.strip() if r else "（无 systemctl）"))
+    if cfg:
+        b = "http://127.0.0.1:%s/%s" % (cfg.get("port"), cfg.get("token"))
+        for p in ("sub", "clash", "singbox", "singbox-cn"):
+            print("本机访问 /%-10s -> HTTP %s" % (p, http_code("%s/%s" % (b, p))))
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    print("来源数量: %d" % len(sources))
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        print("  [%d] %s: %s，节点 %s" % (idx + 1, source_label(s, idx), r.get("status", "未刷新"), r.get("count", "?")))
+    print(LINE)
+    if shutil.which("journalctl"):
+        r = run(["journalctl", "-u", "msub-web", "-n", "8", "--no-pager"])
+        if r:
+            print(r.stdout)
+
+
+def script_version_of(text):
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
+
+
+def changelog_newer(text, local):
+    m = re.search(r"# CHANGELOG-BEGIN\n(.*?)# CHANGELOG-END", text, re.S)
+    out = []
+    if m:
+        for ln in m.group(1).splitlines():
+            mm = re.match(r"# (\d[\w.\-]*)\s+(.*)", ln)
+            if mm and ver_tuple(mm.group(1)) > ver_tuple(local):
+                out.append("   %s  %s" % (mm.group(1), mm.group(2)))
+    return out
+
+
+def upgrade(assume_yes=False, check_only=False):
+    print("当前脚本版本: %s" % VERSION)
+    try:
+        text = http_get(SCRIPT_URL)
+    except Exception as e:
+        print("❌ 下载失败: %s\n   %s" % (SCRIPT_URL, e))
+        return
+    rv = script_version_of(text)
+    if not rv:
+        print("❌ 远程文件里没有版本号，可能地址不对，已放弃。")
+        return
+    try:
+        compile(text, "msub", "exec")
+    except SyntaxError as e:
+        print("❌ 远程脚本语法检查未通过，已放弃: %s" % e)
+        return
+    print("远程最新版本: %s" % rv)
+    newer = ver_tuple(rv) > ver_tuple(VERSION)
+    if newer:
+        print("🆕 更新内容:")
+        for l in changelog_newer(text, VERSION):
+            print(l)
+    else:
+        print("✅ 已经是最新版本。")
+    if check_only:
+        return
+    if not assume_yes:
+        ans = input("确定升级吗？(Y/n): " if newer else "仍要强制重新安装吗？(y/N): ").strip().lower()
+        if newer and ans.startswith("n"):
+            print("❌ 已取消。")
+            return
+        if not newer and not ans.startswith("y"):
+            return
+    need_root()
+    write_atomic(BIN_PATH, text, 0o755)
+    print("✅ 已更新到 %s，正在应用..." % rv)
+    py = sys.executable or "/usr/bin/python3"
+    os.execv(py, [py, BIN_PATH, "post-upgrade"])
+
+
+def post_upgrade():
+    cfg = load_cfg()
+    if cfg:
+        write_units(cfg)
+        sc("restart", "msub-web")
+        sc("restart", "msub-refresh.timer")
+        do_refresh()
+        print("✅ 升级完成。")
+
+
+def uninstall():
+    print(LINE)
+    print("⚠️  将删除订阅服务、所有来源与生成的订阅文件（不影响其他 VPS 和你的节点）。")
+    if input("确定要卸载吗？(y/N): ").strip().lower() not in ("y", "yes"):
+        print("❌ 操作已取消。")
+        return
+    need_root()
+    cfg = load_cfg()
+    for u in ("msub-web", "msub-refresh.timer"):
+        sc("stop", u)
+        sc("disable", u)
+    for f in (WEB_UNIT, REFRESH_UNIT, TIMER_UNIT):
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+    sc("daemon-reload")
+    if cfg.get("port"):
+        close_firewall(int(cfg["port"]))
+    shutil.rmtree(BASE, ignore_errors=True)
+    try:
+        os.unlink(BIN_PATH)
+    except Exception:
+        pass
+    print("✅ 卸载完成。")
+    sys.exit(0)
+
+
+# ============================================================
+#  菜单 / 入口
+# ============================================================
+
+def menu():
+    cfg = ensure_cfg()
+    while True:
+        print(LINE)
+        print("      msub 订阅合并工具  v%s" % VERSION)
+        print(LINE)
+        print("  1. 查看订阅链接 / 二维码")
+        print("  2. 添加来源：订阅地址（其他 VPS 的订阅链接，推荐）")
+        print("  3. 添加来源：粘贴节点链接（可多行）")
+        print("  4. 查看来源与节点")
+        print("  5. 删除来源")
+        print("  6. 立即刷新")
+        print("  7. 设置（端口 / 刷新间隔 / token / IP）")
+        print("  8. 状态检测")
+        print("  9. 检查并升级本脚本")
+        print(" 10. 卸载")
+        print("  0. 退出")
+        print(LINE)
+        print(" 💡 快捷命令: 输入 msub 即可打开本菜单")
+        print("    直达: msub show | add-url | add-links | list | remove | refresh | status | upgrade")
+        print(LINE)
+        try:
+            c = input("请输入数字选择 [0-10]: ").strip()
+        except EOFError:
+            return
+        cfg = load_cfg()
+        if c == "1":
+            if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+                print("ℹ️  还没有可用订阅，请先添加来源。")
+            else:
+                q = input("是否同时显示二维码？(y/N): ").strip().lower() == "y"
+                show_urls(cfg, qr=q)
+        elif c == "2":
+            add_url()
+        elif c == "3":
+            add_links()
+        elif c == "4":
+            list_sources()
+        elif c == "5":
+            remove_source()
+        elif c == "6":
+            do_refresh()
+        elif c == "7":
+            settings()
+        elif c == "8":
+            status()
+        elif c == "9":
+            upgrade()
+        elif c == "10":
+            uninstall()
+        elif c == "0":
+            return
+        else:
+            print("❌ 无效输入。")
+        print("")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    rest = argv[2:]
+    if cmd == "version":
+        print(VERSION)
+        return
+    if cmd == "serve":
+        do_serve()
+        return
+    if cmd in ("", "menu"):
+        need_root()
+        menu()
+        return
+    need_root()
+    if cmd == "show":
+        cfg = ensure_cfg()
+        show_urls(cfg, qr=("qr" in rest))
+    elif cmd == "add-url":
+        add_url(rest[0] if rest else None, rest[1] if len(rest) > 1 else None)
+    elif cmd == "add-links":
+        add_links()
+    elif cmd == "list":
+        list_sources()
+    elif cmd == "remove":
+        remove_source(rest[0] if rest else None)
+    elif cmd == "refresh":
+        do_refresh(verbose="--quiet" not in rest)
+    elif cmd == "status":
+        status()
+    elif cmd == "upgrade":
+        upgrade(assume_yes="-y" in rest)
+    elif cmd == "check":
+        upgrade(check_only=True)
+    elif cmd == "post-upgrade":
+        post_upgrade()
+    elif cmd == "uninstall":
+        uninstall()
+    elif cmd == "setup":
+        setup()
+    else:
+        print("未知命令: %s" % cmd)
+        print("可用: show [qr] | add-url [地址] [名称] | add-links | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except KeyboardInterrupt:
+        print("\n已取消。")
