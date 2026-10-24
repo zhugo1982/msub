@@ -27,9 +27,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.2.1  修复：部分 sing-box 订阅里的节点缺少 server 等字段导致合并时报错；现在会自动补全或跳过异常节点并提示原因
 # 1.2.0  添加完成后可返回主菜单；新增来源与节点管理（改来源名、改节点名）；sing-box 大陆直连分流订阅新增 Telegram/YouTube/Muse/Claude/X/Facebook/Gemini/Instagram 指定分流，可自定义服务
 # 1.1.0  添加来源合并为一个入口（订阅地址和节点链接可混贴、可多次粘贴）；合并后只输出链接，二维码单独选项查看；合并后可选继续添加或退出
 # 1.0.0  首个版本：合并多台 VPS 的订阅/节点，输出通用订阅、sing-box、Clash，并生成二维码
@@ -528,11 +529,37 @@ def parse_link(line):
 #  节点结构:  {"out": sing-box 出站, "helpers": [辅助出站, 如 shadowtls]}
 # ============================================================
 
+REQUIRED_FIELDS = {
+    "vless": ["uuid"], "vmess": ["uuid"], "trojan": ["password"],
+    "shadowsocks": ["method", "password"], "hysteria2": ["password"],
+    "tuic": ["uuid"], "anytls": ["password"], "socks": [],
+}
+
+
+def node_problem(n):
+    """返回节点存在的问题描述；没问题返回空字符串"""
+    o = n.get("out") or {}
+    if o.get("type") not in REQUIRED_FIELDS:
+        return "不支持的类型"
+    if not o.get("server"):
+        return "缺少服务器地址"
+    try:
+        port = int(o.get("server_port"))
+    except (TypeError, ValueError):
+        return "缺少或错误的端口"
+    if not (1 <= port <= 65535):
+        return "端口超出范围"
+    for f in REQUIRED_FIELDS[o["type"]]:
+        if not o.get(f):
+            return "缺少字段 %s" % f
+    return ""
+
+
 def nodes_from_singbox_json(text):
     j = json.loads(text)
     obs = j.get("outbounds") or []
     by_tag = {o.get("tag"): o for o in obs}
-    nodes = []
+    nodes, skipped = [], []
     for o in obs:
         if o.get("type") not in SUPPORTED:
             continue
@@ -542,10 +569,22 @@ def nodes_from_singbox_json(text):
             t = by_tag.get(d)
             if t and t.get("type") == "shadowtls":
                 node["helpers"].append(copy.deepcopy(t))
+                # 经 ShadowTLS 的节点，服务器地址常写在辅助出站里，这里补齐
+                if not node["out"].get("server"):
+                    node["out"]["server"] = t.get("server", "")
+                if not node["out"].get("server_port"):
+                    node["out"]["server_port"] = t.get("server_port")
             else:
                 node["out"].pop("detour", None)
+        if not node["out"].get("tag"):
+            node["out"]["tag"] = "%s-%s:%s" % (o.get("type"), node["out"].get("server", "?"),
+                                              node["out"].get("server_port", "?"))
+        why = node_problem(node)
+        if why:
+            skipped.append((str(node["out"].get("tag")), why))
+            continue
         nodes.append(node)
-    return nodes
+    return nodes, skipped
 
 
 def extract_lines(text):
@@ -565,7 +604,11 @@ def parse_lines(lines):
     nodes, skipped = [], []
     for ln in lines:
         try:
-            nodes.append({"out": parse_link(ln), "helpers": []})
+            n = {"out": parse_link(ln), "helpers": []}
+            why = node_problem(n)
+            if why:
+                raise ValueError(why)
+            nodes.append(n)
         except (ValueError, KeyError, TypeError) as e:
             skipped.append((ln[:50] + ("…" if len(ln) > 50 else ""), str(e)))
     return nodes, skipped
@@ -575,7 +618,7 @@ def parse_content(text):
     t = text.strip()
     if t.startswith("{"):
         try:
-            return nodes_from_singbox_json(t), []
+            return nodes_from_singbox_json(t)
         except (json.JSONDecodeError, AttributeError):
             pass
     return parse_lines(extract_lines(t))
@@ -881,6 +924,13 @@ def y_dump(obj, indent=0):
 
 # ---------- 节点分组辅助 ----------
 
+def safe_convert(fn, node):
+    try:
+        return fn(node)
+    except Exception:
+        return None
+
+
 def is_auto_candidate(node):
     return node["out"]["type"] != "socks" and not node["helpers"]
 
@@ -896,7 +946,7 @@ def source_groups(nodes):
 def build_clash(nodes, cfg):
     proxies, kept = [], []
     for n in nodes:
-        c = to_clash(n)
+        c = safe_convert(to_clash, n)
         if c:
             proxies.append(c)
             kept.append(n)
@@ -1012,7 +1062,7 @@ def node_key(n):
     t = o.get("tls") or {}
     r = t.get("reality") or {}
     tr = o.get("transport") or {}
-    ident = [o["type"], str(o["server"]).lower(), o["server_port"], o.get("uuid"), o.get("password"),
+    ident = [o.get("type"), str(o.get("server", "")).lower(), o.get("server_port"), o.get("uuid"), o.get("password"),
              o.get("username"), o.get("method"), r.get("public_key"), tr.get("type"),
              tr.get("service_name") or tr.get("path")]
     hs = [[h.get("server"), h.get("server_port"), h.get("password")] for h in n["helpers"]]
@@ -1063,7 +1113,8 @@ def collect_nodes():
             else:
                 nodes, skipped = parse_lines(s.get("links", []))
         except Exception as e:
-            cached = read_json(os.path.join(CACHE_DIR, s["id"] + ".json"), [])
+            cached = [n for n in read_json(os.path.join(CACHE_DIR, s["id"] + ".json"), [])
+                      if isinstance(n, dict) and isinstance(n.get("out"), dict) and not node_problem(n)]
             if cached:
                 nodes = cached
                 status = "拉取失败(%s)，使用上次缓存" % e
@@ -1089,7 +1140,7 @@ def collect_nodes():
 
 
 def render_outputs(nodes, cfg):
-    links = [l for l in (to_link(n) for n in nodes) if l]
+    links = [l for l in (safe_convert(to_link, n) for n in nodes) if l]
     os.makedirs(OUT_DIR, exist_ok=True)
     write_atomic(OUT_DIR + "/sub_b64.txt", b64e("\n".join(links).encode("utf-8")))
     write_atomic(OUT_DIR + "/clash.yaml", build_clash(nodes, cfg))
