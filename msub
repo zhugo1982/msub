@@ -68,7 +68,7 @@ DEFAULT_SERVICES = [
      "domains": ["youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com", "ytimg.com",
                  "ggpht.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be"], "cidrs": []},
     {"tag": "Muse",
-     "domains": ["meta.ai", "ai.meta.com"], "cidrs": []},
+     "domains": ["muse.ai"], "cidrs": []},
     {"tag": "Claude",
      "domains": ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"], "cidrs": []},
     {"tag": "X",
