@@ -27,14 +27,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.1.0  添加来源合并为一个入口（订阅地址和节点链接可混贴、可多次粘贴）；合并后只输出链接，二维码单独选项查看；合并后可选继续添加或退出
 # 1.0.0  首个版本：合并多台 VPS 的订阅/节点，输出通用订阅、sing-box、Clash，并生成二维码
 # CHANGELOG-END
 
 # 脚本升级地址（改成你自己 GitHub 仓库里这个文件的原始地址）
-SCRIPT_URL = "https://raw.githubusercontent.com/zhugo1982/msub/refs/heads/main/msub.py"
+SCRIPT_URL = "https://raw.githubusercontent.com/zhugo1982/msub/refs/heads/main/msub"
 
 BIN_PATH = "/usr/local/bin/msub"
 BASE = "/etc/hugo-merge"
@@ -1251,40 +1252,16 @@ def summarize(nodes):
     return "、".join("%s×%d" % (k, v) for k, v in cnt.items())
 
 
-def add_url(url=None, name=None):
-    cfg = ensure_cfg()
-    if not url:
-        print("请输入其他 VPS 的订阅地址（Hugo 脚本的 /sub、/singbox、/clash 地址都可以，会自动取最完整的）：")
-        url = input("订阅地址: ").strip()
-    if not re.match(r"^https?://", url):
-        print("❌ 订阅地址必须以 http:// 或 https:// 开头。")
-        return
-    print("==> 正在拉取并检查...")
+def ask(prompt, default=""):
     try:
-        nodes, used, skipped = fetch_url_nodes(url)
-    except Exception as e:
-        print("❌ 拉取失败: %s" % e)
-        return
-    print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
-    if used != url.strip():
-        print("   （已自动改用更完整的地址: %s）" % used)
-    for ln, why in skipped:
-        print("   跳过: %s  (%s)" % (ln, why))
-    if name is None:
-        name = input("给这台 VPS 起个名字，用作节点名前缀（如 US、日本；回车则不加前缀）: ").strip()
-    sources = load_sources()
-    if any(s.get("type") == "url" and s.get("url") == url.strip() for s in sources):
-        print("ℹ️  这个订阅地址已经添加过了，将直接刷新。")
-    else:
-        sources.append({"id": new_id(sources), "type": "url", "name": name, "url": url.strip(),
-                        "added": int(time.time())})
-        save_sources(sources)
-    finish_add(cfg)
+        v = input(prompt)
+    except EOFError:
+        return default
+    v = v.strip()
+    return v if v else default
 
 
 def read_pasted_lines():
-    print("请粘贴节点链接（支持多行，可分多次粘贴）。")
-    print("粘贴完成后，再按一次回车（空行）结束输入：")
     lines = []
     while True:
         try:
@@ -1299,45 +1276,182 @@ def read_pasted_lines():
     return lines
 
 
-def add_links(lines=None, name=None):
-    cfg = ensure_cfg()
-    if lines is None:
-        lines = read_pasted_lines()
-    expanded = []
+def classify_lines(lines):
+    """把粘贴的行分成: 订阅地址 / 节点链接 / 无法识别"""
+    urls, links, unknown = [], [], []
     for ln in lines:
-        if re.match(r"^https?://", ln):
-            print("ℹ️  检测到订阅地址，请用「添加订阅地址」: %s" % ln[:60])
+        if re.match(r"^https?://", ln, re.I):
+            urls.append(ln)
+        elif "://" in ln:
+            links.append(ln)
+        else:
+            got = [x for x in extract_lines(ln) if "://" in x and not re.match(r"^https?://", x, re.I)]
+            if got:
+                links.extend(got)
+            else:
+                unknown.append(ln)
+    return urls, links, unknown
+
+
+def collect_round(lines, pending, known_urls):
+    """处理一轮粘贴的内容，结果累加到 pending"""
+    urls, links, unknown = classify_lines(lines)
+    for ln in unknown:
+        print("   无法识别，已忽略: %s" % (ln[:50] + ("…" if len(ln) > 50 else "")))
+    for url in urls:
+        if url in known_urls or any(p["url"] == url for p in pending["urls"]):
+            print("ℹ️  这个订阅地址已经添加过，跳过: %s" % url)
             continue
-        if "://" in ln:
-            expanded.append(ln)
+        print("==> 拉取并检查: %s" % url)
+        try:
+            nodes, used, skipped = fetch_url_nodes(url)
+        except Exception as e:
+            print("❌ 拉取失败，已跳过: %s" % e)
+            continue
+        print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+        if used != url:
+            print("   （已自动改用更完整的地址: %s）" % used)
+        for ln, why in skipped:
+            print("   跳过: %s  (%s)" % (ln, why))
+        name = ask("   给这台 VPS 起个名字，用作节点名前缀（如 US、日本；回车不加前缀）: ")
+        pending["urls"].append({"url": url, "name": name, "count": len(nodes)})
+    if links:
+        good, total, skipped = [], 0, []
+        nodes_all = []
+        for ln in links:
+            n1, s1 = parse_lines([ln])
+            if n1:
+                good.append(ln)
+                nodes_all.extend(n1)
+            else:
+                skipped.extend(s1)
+        for ln, why in skipped:
+            print("   跳过: %s  (%s)" % (ln, why))
+        if good:
+            print("✅ 识别到 %d 个节点: %s" % (len(nodes_all), summarize(nodes_all)))
+            name = ask("   给这批节点链接起个名字，用作节点名前缀（如 日本；回车不加前缀）: ")
+            pending["batches"].append({"name": name, "links": good, "count": len(nodes_all)})
         else:
-            expanded.extend(extract_lines(ln))
-    nodes, skipped, good_lines = [], [], []
-    for ln in expanded:
-        n1, s1 = parse_lines([ln])
-        if n1:
-            nodes.extend(n1)
-            good_lines.append(ln)
-        else:
-            skipped.extend(s1)
-    for ln, why in skipped:
-        print("   跳过: %s  (%s)" % (ln, why))
-    if not nodes:
-        print("❌ 没有识别到有效的节点链接。")
-        return
-    print("✅ 识别到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
-    if name is None:
-        name = input("给这批节点起个名字，用作节点名前缀（如 US、日本；回车则不加前缀）: ").strip()
-    sources = load_sources()
-    sources.append({"id": new_id(sources), "type": "links", "name": name, "links": good_lines,
-                    "added": int(time.time())})
-    save_sources(sources)
-    finish_add(cfg)
+            print("❌ 这一轮没有识别到有效的节点链接。")
+
+
+def add_sources():
+    """统一的添加入口: 可混贴订阅地址与节点链接，可多次粘贴，最后生成合并链接。
+    返回 "exit" 表示用户选择退出程序。"""
+    cfg = ensure_cfg()
+    while True:                                   # 外层: 一次「生成」为一个循环
+        pending = {"urls": [], "batches": []}
+        known = {s.get("url") for s in load_sources() if s.get("type") == "url"}
+        while True:                               # 内层: 多轮粘贴
+            print(LINE)
+            print("请粘贴【订阅地址】或【节点链接】（可混合、可多行）。")
+            print("粘贴完成后，再按一次回车（空行）结束本轮：")
+            lines = read_pasted_lines()
+            if lines:
+                collect_round(lines, pending, known)
+            total = sum(p["count"] for p in pending["urls"]) + sum(b["count"] for b in pending["batches"])
+            print(LINE)
+            print("📦 已收集: 订阅地址 %d 个、节点链接 %d 批，共 %d 个节点" % (len(pending["urls"]), len(pending["batches"]), total))
+            c = ask("  1. 继续粘贴    2. 生成合并链接（直接回车）    0. 放弃本次添加\n请选择 [1/2/0]: ", "2")
+            if c == "1":
+                continue
+            if c == "0":
+                print("❌ 已放弃，本次粘贴的内容没有保存。")
+                return None
+            if total == 0 and not load_sources():
+                print("⚠️  还没有收集到任何有效内容。")
+                c2 = ask("  1. 继续粘贴    0. 放弃\n请选择 [1/0]: ", "1")
+                if c2 == "0":
+                    print("❌ 已放弃。")
+                    return None
+                continue
+            break
+        sources = load_sources()
+        for p in pending["urls"]:
+            sources.append({"id": new_id(sources), "type": "url", "name": p["name"], "url": p["url"],
+                            "added": int(time.time())})
+        for b in pending["batches"]:
+            sources.append({"id": new_id(sources), "type": "links", "name": b["name"], "links": b["links"],
+                            "added": int(time.time())})
+        if pending["urls"] or pending["batches"]:
+            save_sources(sources)
+        print("==> 正在合并并生成订阅...")
+        if do_refresh() > 0:
+            show_urls(cfg, qr=False)
+            print("💡 需要二维码时，运行 msub 选择「订阅二维码」（或 msub qr）。")
+        c = ask("  1. 继续添加来源    0. 退出\n请选择 [1/0]: ", "0")
+        if c == "1":
+            continue
+        return "exit"
 
 
 def finish_add(cfg):
     print("==> 正在合并并生成订阅...")
     if do_refresh() > 0:
+        show_urls(cfg, qr=False)
+
+
+def add_url(url, name=""):
+    """非交互添加订阅地址（命令行 msub add-url 地址 名称）"""
+    cfg = ensure_cfg()
+    if not re.match(r"^https?://", url or ""):
+        print("❌ 订阅地址必须以 http:// 或 https:// 开头。")
+        return
+    try:
+        nodes, used, skipped = fetch_url_nodes(url)
+    except Exception as e:
+        print("❌ 拉取失败: %s" % e)
+        return
+    print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+    if used != url.strip():
+        print("   （已自动改用更完整的地址: %s）" % used)
+    sources = load_sources()
+    if not any(s.get("type") == "url" and s.get("url") == url.strip() for s in sources):
+        sources.append({"id": new_id(sources), "type": "url", "name": name or "", "url": url.strip(),
+                        "added": int(time.time())})
+        save_sources(sources)
+    finish_add(cfg)
+
+
+def add_links(lines, name=""):
+    """非交互添加节点链接（命令行: cat 链接文件 | msub add-links 名称）"""
+    cfg = ensure_cfg()
+    urls, links, unknown = classify_lines(lines)
+    for u in urls:
+        print("ℹ️  检测到订阅地址，请用 msub add-url 添加: %s" % u[:60])
+    good, nodes_all = [], []
+    for ln in links:
+        n1, s1 = parse_lines([ln])
+        if n1:
+            good.append(ln)
+            nodes_all.extend(n1)
+        else:
+            for l2, why in s1:
+                print("   跳过: %s  (%s)" % (l2, why))
+    if not good:
+        print("❌ 没有识别到有效的节点链接。")
+        return
+    print("✅ 识别到 %d 个节点: %s" % (len(nodes_all), summarize(nodes_all)))
+    sources = load_sources()
+    sources.append({"id": new_id(sources), "type": "links", "name": name or "", "links": good,
+                    "added": int(time.time())})
+    save_sources(sources)
+    finish_add(cfg)
+
+
+def qr_menu(cfg):
+    if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+        print("ℹ️  还没有可用订阅，请先添加来源。")
+        return
+    items = url_list(cfg)
+    print(LINE)
+    for i, (t, _, _) in enumerate(items, 1):
+        print("  %d. %s" % (i, t))
+    print("  5. 全部显示")
+    c = ask("请选择要显示二维码的订阅 [1-5，直接回车返回]: ")
+    if c in ("1", "2", "3", "4"):
+        show_urls(cfg, qr=True, only=int(c) - 1)
+    elif c == "5":
         show_urls(cfg, qr=True)
 
 
@@ -1577,9 +1691,9 @@ def menu():
         print(LINE)
         print("      msub 订阅合并工具  v%s" % VERSION)
         print(LINE)
-        print("  1. 查看订阅链接 / 二维码")
-        print("  2. 添加来源：订阅地址（其他 VPS 的订阅链接，推荐）")
-        print("  3. 添加来源：粘贴节点链接（可多行）")
+        print("  1. 添加来源（粘贴订阅地址 / 节点链接，可混合、可多次）")
+        print("  2. 查看合并订阅链接")
+        print("  3. 订阅二维码")
         print("  4. 查看来源与节点")
         print("  5. 删除来源")
         print("  6. 立即刷新")
@@ -1590,7 +1704,7 @@ def menu():
         print("  0. 退出")
         print(LINE)
         print(" 💡 快捷命令: 输入 msub 即可打开本菜单")
-        print("    直达: msub show | add-url | add-links | list | remove | refresh | status | upgrade")
+        print("    直达: msub add | show | qr | list | remove | refresh | status | upgrade")
         print(LINE)
         try:
             c = input("请输入数字选择 [0-10]: ").strip()
@@ -1598,15 +1712,15 @@ def menu():
             return
         cfg = load_cfg()
         if c == "1":
+            if add_sources() == "exit":
+                return
+        elif c == "2":
             if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
                 print("ℹ️  还没有可用订阅，请先添加来源。")
             else:
-                q = input("是否同时显示二维码？(y/N): ").strip().lower() == "y"
-                show_urls(cfg, qr=q)
-        elif c == "2":
-            add_url()
+                show_urls(cfg, qr=False)
         elif c == "3":
-            add_links()
+            qr_menu(cfg)
         elif c == "4":
             list_sources()
         elif c == "5":
@@ -1645,10 +1759,22 @@ def main(argv):
     if cmd == "show":
         cfg = ensure_cfg()
         show_urls(cfg, qr=("qr" in rest))
+    elif cmd == "qr":
+        cfg = ensure_cfg()
+        if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+            print("ℹ️  还没有可用订阅，请先添加来源。")
+        elif rest and rest[0] in ("1", "2", "3", "4"):
+            show_urls(cfg, qr=True, only=int(rest[0]) - 1)
+        elif rest and rest[0] == "all":
+            show_urls(cfg, qr=True)
+        else:
+            qr_menu(cfg)
+    elif cmd == "add":
+        add_sources()
     elif cmd == "add-url":
-        add_url(rest[0] if rest else None, rest[1] if len(rest) > 1 else None)
+        add_url(rest[0] if rest else "", rest[1] if len(rest) > 1 else "")
     elif cmd == "add-links":
-        add_links()
+        add_links([l.strip() for l in sys.stdin.read().splitlines() if l.strip()], rest[0] if rest else "")
     elif cmd == "list":
         list_sources()
     elif cmd == "remove":
@@ -1669,7 +1795,7 @@ def main(argv):
         setup()
     else:
         print("未知命令: %s" % cmd)
-        print("可用: show [qr] | add-url [地址] [名称] | add-links | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
+        print("可用: add | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
         sys.exit(1)
 
 
