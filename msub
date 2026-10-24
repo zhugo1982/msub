@@ -27,9 +27,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.2.0  添加完成后可返回主菜单；新增来源与节点管理（改来源名、改节点名）；sing-box 大陆直连分流订阅新增 Telegram/YouTube/Muse/Claude/X/Facebook/Gemini/Instagram 指定分流，可自定义服务
 # 1.1.0  添加来源合并为一个入口（订阅地址和节点链接可混贴、可多次粘贴）；合并后只输出链接，二维码单独选项查看；合并后可选继续添加或退出
 # 1.0.0  首个版本：合并多台 VPS 的订阅/节点，输出通用订阅、sing-box、Clash，并生成二维码
 # CHANGELOG-END
@@ -50,6 +51,40 @@ LINE = "=" * 60
 WEB_UNIT = "/etc/systemd/system/msub-web.service"
 REFRESH_UNIT = "/etc/systemd/system/msub-refresh.service"
 TIMER_UNIT = "/etc/systemd/system/msub-refresh.timer"
+
+SERV_FILE = BASE + "/services.json"
+RESERVED_TAGS = {"proxy", "auto", "direct", "节点选择", "自动选择", "DIRECT"}
+
+# 指定分流服务（用于 sing-box「大陆直连分流」订阅）。每个服务会生成一个可单独选节点的分组。
+# 域名未覆盖到的流量不会出错，只是走默认的 proxy 分组。可在 msub 设置里增删自定义服务。
+DEFAULT_SERVICES = [
+    {"tag": "Telegram",
+     "domains": ["telegram.org", "telegram.me", "t.me", "telegra.ph", "telesco.pe", "tdesktop.com",
+                 "telegram-cdn.org", "cdn-telegram.org", "tg.dev", "graph.org"],
+     "cidrs": ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
+               "91.108.56.0/22", "149.154.160.0/20", "2001:67c:4e8::/48", "2001:b28:f23d::/48",
+               "2001:b28:f23f::/48", "2a0a:f280::/32"]},
+    {"tag": "YouTube",
+     "domains": ["youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com", "ytimg.com",
+                 "ggpht.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be"], "cidrs": []},
+    {"tag": "Muse",
+     "domains": ["meta.ai", "ai.meta.com"], "cidrs": []},
+    {"tag": "Claude",
+     "domains": ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"], "cidrs": []},
+    {"tag": "X",
+     "domains": ["x.com", "twitter.com", "t.co", "twimg.com", "twittercdn.com", "pscp.tv", "periscope.tv"],
+     "cidrs": []},
+    {"tag": "Facebook",
+     "domains": ["facebook.com", "fb.com", "fb.me", "fbcdn.net", "facebook.net", "fbsbx.com",
+                 "messenger.com", "m.me", "fburl.com"], "cidrs": []},
+    {"tag": "Gemini",
+     "domains": ["gemini.google.com", "gemini.google", "bard.google.com", "aistudio.google.com", "ai.google.dev",
+                 "makersuite.google.com", "generativelanguage.googleapis.com", "notebooklm.google.com",
+                 "notebooklm.google", "labs.google", "deepmind.google", "deepmind.com",
+                 "aisandbox-pa.googleapis.com"], "cidrs": []},
+    {"tag": "Instagram",
+     "domains": ["instagram.com", "cdninstagram.com", "instagr.am", "ig.me"], "cidrs": []},
+]
 
 SUPPORTED = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "anytls", "socks"}
 
@@ -199,6 +234,35 @@ def load_cfg():
 
 def save_cfg(cfg):
     write_json(CFG_FILE, cfg)
+
+
+def load_services():
+    d = read_json(SERV_FILE, None)
+    if isinstance(d, dict) and isinstance(d.get("services"), list):
+        return d["services"]
+    return copy.deepcopy(DEFAULT_SERVICES)
+
+
+def save_services(sv):
+    write_json(SERV_FILE, {"services": sv})
+
+
+DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$")
+
+
+def parse_domains(text):
+    """把用户输入拆成域名后缀列表，返回 (有效列表, 无效列表)"""
+    good, bad = [], []
+    for d in re.split(r"[,\s;，]+", text.strip().lower()):
+        d = d.strip().lstrip("*.").lstrip(".")
+        if not d:
+            continue
+        if DOMAIN_RE.match(d) and "." in d:
+            if d not in good:
+                good.append(d)
+        else:
+            bad.append(d)
+    return good, bad
 
 
 def load_sources():
@@ -870,7 +934,7 @@ def build_clash(nodes, cfg):
     return "\n".join(y_dump(doc)) + "\n"
 
 
-def build_singbox(nodes, cfg, cn=False):
+def build_singbox(nodes, cfg, cn=False, services=None):
     outs, tags = [], []
     for n in nodes:
         outs.append(copy.deepcopy(n["out"]))
@@ -904,13 +968,23 @@ def build_singbox(nodes, cfg, cn=False):
                       "action": "route", "outbound": "direct"})
     rules.append({"ip_is_private": True, "action": "route", "outbound": "direct"})
 
+    svc_outs = []
+    if cn and services:
+        opts = ["proxy"] + sel + tags
+        for sv in services:
+            svc_outs.append({"type": "selector", "tag": sv["tag"], "outbounds": list(opts), "default": "proxy"})
+            if sv.get("domains"):
+                rules.append({"domain_suffix": list(sv["domains"]), "action": "route", "outbound": sv["tag"]})
+            if sv.get("cidrs"):
+                rules.append({"ip_cidr": list(sv["cidrs"]), "action": "route", "outbound": sv["tag"]})
+
     doc = {
         "log": {"level": "warn"},
         "dns": {"servers": [{"type": "https", "tag": "dns-remote", "server": "1.1.1.1", "detour": "proxy"},
                             {"type": "udp", "tag": "dns-local", "server": "223.5.5.5"}],
                 "final": "dns-remote"},
         "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"], "auto_route": True}],
-        "outbounds": [selector] + group_outs + outs + [{"type": "direct", "tag": "direct"}],
+        "outbounds": [selector] + group_outs + svc_outs + outs + [{"type": "direct", "tag": "direct"}],
         "route": {"rules": rules, "final": "proxy", "auto_detect_interface": True,
                   "default_domain_resolver": "dns-local"},
     }
@@ -954,10 +1028,13 @@ def uniq(tag, seen):
     return tag
 
 
-def retag(node, prefix, seen):
+def retag(node, prefix, seen, override=None):
     old = node["out"]["tag"]
     base = old[5:] if old.startswith("Hugo-") else old
-    tag = uniq("%s-%s" % (prefix, base) if prefix else base, seen)
+    if override:
+        tag = uniq(override, seen)
+    else:
+        tag = uniq("%s-%s" % (prefix, base) if prefix else base, seen)
     node["out"]["tag"] = tag
     for i, h in enumerate(node["helpers"]):
         h["tag"] = uniq("%s-helper%d" % (tag, i + 1), seen)
@@ -971,7 +1048,11 @@ def source_label(s, idx):
 def collect_nodes():
     sources = load_sources()
     allnodes, report = [], {}
-    seen_tags, seen_keys = set(), set()
+    seen_keys = set()
+    seen_tags = set(RESERVED_TAGS) | {sv["tag"] for sv in load_services()}
+    for i, s0 in enumerate(sources):
+        lab = source_label(s0, i)
+        seen_tags.update(["auto-%s" % lab, "自动-%s" % lab])
     os.makedirs(CACHE_DIR, exist_ok=True)
     for idx, s in enumerate(sources):
         nodes, status = [], "ok"
@@ -989,18 +1070,20 @@ def collect_nodes():
             else:
                 status = "拉取失败: %s" % e
         label = source_label(s, idx)
-        kept = []
+        kept, keys = [], []
+        renames = s.get("renames", {})
         for n in nodes:
             k = node_key(n)
             if k in seen_keys:
                 continue
             seen_keys.add(k)
-            retag(n, s.get("name", ""), seen_tags)
+            retag(n, s.get("name", ""), seen_tags, override=renames.get(k))
             n["source"] = label
             kept.append(n)
+            keys.append(k)
         allnodes.extend(kept)
         report[s["id"]] = {"status": status, "count": len(kept), "tags": [n["out"]["tag"] for n in kept],
-                           "time": int(time.time())}
+                           "keys": keys, "time": int(time.time())}
     write_json(REPORT_FILE, report)
     return allnodes, report
 
@@ -1011,7 +1094,7 @@ def render_outputs(nodes, cfg):
     write_atomic(OUT_DIR + "/sub_b64.txt", b64e("\n".join(links).encode("utf-8")))
     write_atomic(OUT_DIR + "/clash.yaml", build_clash(nodes, cfg))
     write_atomic(OUT_DIR + "/singbox.json", build_singbox(nodes, cfg, cn=False))
-    write_atomic(OUT_DIR + "/singbox-cn.json", build_singbox(nodes, cfg, cn=True))
+    write_atomic(OUT_DIR + "/singbox-cn.json", build_singbox(nodes, cfg, cn=True, services=load_services()))
     return len(links)
 
 
@@ -1191,7 +1274,7 @@ def url_list(cfg):
         ("通用订阅（小火箭 / V2rayN / v2rayNG / NekoBox）", b + "/sub", b + "/sub"),
         ("sing-box 苹果端 - 全局代理", b + "/singbox",
          "sing-box://import-remote-profile?url=%s#Merge-Global" % quote(b + "/singbox")),
-        ("sing-box 苹果端 - 大陆直连分流", b + "/singbox-cn",
+        ("sing-box 苹果端 - 大陆直连分流（含 Telegram / YouTube / Claude 等指定分流）", b + "/singbox-cn",
          "sing-box://import-remote-profile?url=%s#Merge-CN" % quote(b + "/singbox-cn")),
         ("Clash Meta / Mihomo", b + "/clash", b + "/clash"),
     ]
@@ -1379,10 +1462,12 @@ def add_sources():
         if do_refresh() > 0:
             show_urls(cfg, qr=False)
             print("💡 需要二维码时，运行 msub 选择「订阅二维码」（或 msub qr）。")
-        c = ask("  1. 继续添加来源    0. 退出\n请选择 [1/0]: ", "0")
+        c = ask("  1. 继续添加来源    2. 返回主菜单（直接回车）    0. 退出程序\n请选择 [1/2/0]: ", "2")
         if c == "1":
             continue
-        return "exit"
+        if c == "0":
+            return "exit"
+        return "menu"
 
 
 def finish_add(cfg):
@@ -1455,6 +1540,172 @@ def qr_menu(cfg):
         show_urls(cfg, qr=True)
 
 
+def clean_name(v, maxlen=60):
+    v = (v or "").strip()
+    if not v or len(v) > maxlen or any(ord(ch) < 32 for ch in v):
+        return None
+    return v
+
+
+def all_report_tags():
+    tags = set()
+    for r in read_json(REPORT_FILE, {}).values():
+        tags.update(r.get("tags", []))
+    return tags
+
+
+def rename_source():
+    sources = load_sources()
+    if not sources:
+        print("（还没有添加任何来源）")
+        return
+    report = read_json(REPORT_FILE, {})
+    print(LINE)
+    for idx, s in enumerate(sources):
+        print("  %d. %s  (%s，节点 %s 个)" % (idx + 1, source_label(s, idx),
+                                            "订阅地址" if s["type"] == "url" else "粘贴节点",
+                                            report.get(s["id"], {}).get("count", "?")))
+    v = ask("请输入要改名的来源编号（直接回车返回）: ")
+    if not v.isdigit() or not (1 <= int(v) <= len(sources)):
+        return
+    s = sources[int(v) - 1]
+    print("当前名称: %s（作为节点名前缀，例如 %s-Reality-TCP）" % (s.get("name") or "（无）", s.get("name") or "名称"))
+    new = ask("新名称（输入 - 表示不加前缀，直接回车取消）: ")
+    if not new:
+        return
+    if new == "-":
+        new = ""
+    else:
+        new = clean_name(new, 30)
+        if new is None:
+            print("❌ 名称无效（不能为空、不能含换行、最长 30 个字符）。")
+            return
+    s["name"] = new
+    save_sources(sources)
+    do_refresh(verbose=False)
+    print("✅ 来源名称已改为: %s，订阅已更新。" % (new or "（无前缀）"))
+
+
+def rename_node():
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    flat = []
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        for tag, key in zip(r.get("tags", []), r.get("keys", [])):
+            flat.append((idx, key, tag))
+    if not flat:
+        print("还没有可改名的节点（可先选「立即刷新」）。")
+        return
+    print(LINE)
+    last = -1
+    for i, (idx, key, tag) in enumerate(flat, 1):
+        if idx != last:
+            print("【%s】" % source_label(sources[idx], idx))
+            last = idx
+        mark = "  ✎" if key in sources[idx].get("renames", {}) else ""
+        print("  %3d. %s%s" % (i, tag, mark))
+    v = ask("请输入要改名的节点编号（直接回车返回）: ")
+    if not v.isdigit() or not (1 <= int(v) <= len(flat)):
+        return
+    idx, key, tag = flat[int(v) - 1]
+    new = ask("「%s」的新名称（输入 - 恢复默认名称，直接回车取消）: " % tag)
+    if not new:
+        return
+    s = sources[idx]
+    if new == "-":
+        s.setdefault("renames", {}).pop(key, None)
+    else:
+        name = clean_name(new, 60)
+        if name is None:
+            print("❌ 名称无效（不能为空、不能含换行、最长 60 个字符）。")
+            return
+        if name in RESERVED_TAGS or name in {x["tag"] for x in load_services()}:
+            print("❌ 这个名称是系统保留的分组名，请换一个。")
+            return
+        s.setdefault("renames", {})[key] = name
+    save_sources(sources)
+    do_refresh(verbose=False)
+    nr = read_json(REPORT_FILE, {}).get(s["id"], {})
+    shown = [t for t, k in zip(nr.get("tags", []), nr.get("keys", [])) if k == key]
+    print("✅ 已更新，现在的名称: %s" % (shown[0] if shown else "?"))
+
+
+def manage_menu():
+    while True:
+        print(LINE)
+        print("  来源与节点管理")
+        print("  1. 查看来源与节点")
+        print("  2. 修改来源名称（节点名前缀）")
+        print("  3. 修改节点名称")
+        print("  4. 删除来源")
+        print("  0. 返回主菜单")
+        print(LINE)
+        c = ask("请选择 [0-4]: ", "0")
+        if c == "1":
+            list_sources()
+        elif c == "2":
+            rename_source()
+        elif c == "3":
+            rename_node()
+        elif c == "4":
+            remove_source()
+        else:
+            return
+
+
+def services_menu():
+    while True:
+        sv = load_services()
+        print(LINE)
+        print("  分流服务（sing-box「大陆直连分流」订阅里，每个服务可单独选择节点）")
+        if not sv:
+            print("  （当前没有任何分流服务）")
+        for i, x in enumerate(sv, 1):
+            extra = "，IP 段 %d 条" % len(x["cidrs"]) if x.get("cidrs") else ""
+            print("  %2d. %-12s 域名 %d 条%s" % (i, x["tag"], len(x.get("domains", [])), extra))
+        print("  a. 添加自定义服务    d. 删除服务    r. 恢复默认    0. 返回")
+        print(LINE)
+        c = ask("请选择: ", "0").lower()
+        changed = False
+        if c == "a":
+            name = clean_name(ask("服务名称（如 OpenAI；直接回车取消）: "), 20)
+            if not name:
+                continue
+            if (name in RESERVED_TAGS or name.startswith("auto-") or name in all_report_tags()
+                    or any(x["tag"].lower() == name.lower() for x in sv)):
+                print("❌ 这个名称已被占用或是保留名称，请换一个。")
+                continue
+            good, bad = parse_domains(ask("域名（逗号或空格分隔，如 openai.com chatgpt.com）: "))
+            for b in bad:
+                print("   忽略无效域名: %s" % b)
+            if not good:
+                print("❌ 没有有效域名。")
+                continue
+            sv.append({"tag": name, "domains": good, "cidrs": []})
+            save_services(sv)
+            changed = True
+        elif c == "d":
+            v = ask("请输入要删除的编号: ")
+            if v.isdigit() and 1 <= int(v) <= len(sv):
+                gone = sv.pop(int(v) - 1)
+                save_services(sv)
+                print("✅ 已删除: %s" % gone["tag"])
+                changed = True
+        elif c == "r":
+            try:
+                os.unlink(SERV_FILE)
+            except Exception:
+                pass
+            print("✅ 已恢复默认分流服务。")
+            changed = True
+        else:
+            return
+        if changed:
+            do_refresh(verbose=False)
+            print("✅ 订阅已更新，请在 sing-box 里更新「大陆直连分流」订阅。")
+
+
 def list_sources():
     sources = load_sources()
     report = read_json(REPORT_FILE, {})
@@ -1505,9 +1756,10 @@ def settings():
     print("  2. 修改自动刷新间隔（当前 %s 小时）" % cfg.get("interval_hours", 3))
     print("  3. 更换订阅 token（所有订阅链接都会变化）")
     print("  4. 修改服务器 IP（当前 %s）" % cfg.get("ip"))
+    print("  5. 分流服务（Telegram / YouTube / Claude 等，用于 sing-box 分流订阅）")
     print("  0. 返回")
     print(LINE)
-    c = input("请选择 [0-4]: ").strip()
+    c = input("请选择 [0-5]: ").strip()
     if c == "1":
         v = input("新端口: ").strip()
         if not v.isdigit() or not (1 <= int(v) <= 65535):
@@ -1552,6 +1804,8 @@ def settings():
         save_cfg(cfg)
         do_refresh(verbose=False)
         print("✅ 已更新。")
+    elif c == "5":
+        services_menu()
 
 
 def http_code(url):
@@ -1692,22 +1946,21 @@ def menu():
         print("      msub 订阅合并工具  v%s" % VERSION)
         print(LINE)
         print("  1. 添加来源（粘贴订阅地址 / 节点链接，可混合、可多次）")
-        print("  2. 查看合并订阅链接")
-        print("  3. 订阅二维码")
-        print("  4. 查看来源与节点")
-        print("  5. 删除来源")
-        print("  6. 立即刷新")
-        print("  7. 设置（端口 / 刷新间隔 / token / IP）")
-        print("  8. 状态检测")
-        print("  9. 检查并升级本脚本")
-        print(" 10. 卸载")
+        print("  2. 来源与节点管理（查看 / 改名 / 删除）")
+        print("  3. 查看合并订阅链接")
+        print("  4. 订阅二维码")
+        print("  5. 立即刷新")
+        print("  6. 设置（端口 / 刷新间隔 / token / IP / 分流服务）")
+        print("  7. 状态检测")
+        print("  8. 检查并升级本脚本")
+        print("  9. 卸载")
         print("  0. 退出")
         print(LINE)
         print(" 💡 快捷命令: 输入 msub 即可打开本菜单")
-        print("    直达: msub add | show | qr | list | remove | refresh | status | upgrade")
+        print("    直达: msub add | manage | show | qr | refresh | status | upgrade")
         print(LINE)
         try:
-            c = input("请输入数字选择 [0-10]: ").strip()
+            c = input("请输入数字选择 [0-9]: ").strip()
         except EOFError:
             return
         cfg = load_cfg()
@@ -1715,25 +1968,23 @@ def menu():
             if add_sources() == "exit":
                 return
         elif c == "2":
+            manage_menu()
+        elif c == "3":
             if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
                 print("ℹ️  还没有可用订阅，请先添加来源。")
             else:
                 show_urls(cfg, qr=False)
-        elif c == "3":
-            qr_menu(cfg)
         elif c == "4":
-            list_sources()
+            qr_menu(cfg)
         elif c == "5":
-            remove_source()
-        elif c == "6":
             do_refresh()
-        elif c == "7":
+        elif c == "6":
             settings()
-        elif c == "8":
+        elif c == "7":
             status()
-        elif c == "9":
+        elif c == "8":
             upgrade()
-        elif c == "10":
+        elif c == "9":
             uninstall()
         elif c == "0":
             return
@@ -1770,7 +2021,10 @@ def main(argv):
         else:
             qr_menu(cfg)
     elif cmd == "add":
-        add_sources()
+        if add_sources() == "menu":
+            menu()
+    elif cmd == "manage":
+        manage_menu()
     elif cmd == "add-url":
         add_url(rest[0] if rest else "", rest[1] if len(rest) > 1 else "")
     elif cmd == "add-links":
@@ -1795,7 +2049,7 @@ def main(argv):
         setup()
     else:
         print("未知命令: %s" % cmd)
-        print("可用: add | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
+        print("可用: add | manage | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
         sys.exit(1)
 
 
