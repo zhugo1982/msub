@@ -12,26 +12,34 @@ msub - 订阅合并工具
 """
 import base64
 import copy
+import getpass
 import hashlib
+import hmac
 import ipaddress
+import http.cookies
 import http.server
+import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import socketserver
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.4.0  新增网页管理界面（手机/电脑浏览器管理节点、查看订阅链接和二维码），默认关闭，需设置密码，独立端口，默认 HTTPS；主菜单新增「网页管理界面」（原 6-10 项顺延）
 # 1.3.2  添加节点时可输入 0 返回主菜单或放弃当前项；分流服务支持编辑（追加/删除域名和 IP 段）
 # 1.3.1  菜单与提示里把「来源」统一称为「节点组」（一个节点组对应客户端里的一个分组）
 # 1.3.0  添加订阅地址/节点链接时可并入已有来源（输入编号或已有名称）；一个来源可同时包含多个订阅地址和粘贴的节点；自动兼容旧版数据
@@ -1206,6 +1214,12 @@ def do_refresh(verbose=True):
             r = report.get(s["id"], {})
             print("  [%s] %s: %s，节点 %d 个" % (idx + 1, source_label(s, idx), r.get("status"), r.get("count", 0)))
     if not nodes:
+        if not load_sources():
+            for fn in ("sub_b64.txt", "clash.yaml", "singbox.json", "singbox-cn.json"):
+                try:
+                    os.unlink(os.path.join(OUT_DIR, fn))
+                except Exception:
+                    pass
         if verbose:
             print("⚠️  当前没有任何可用节点，未更新订阅文件。")
         return 0
@@ -1259,10 +1273,1072 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+# ============================================================
+#  网页管理界面（可选，默认关闭；独立端口，建议 HTTPS）
+# ============================================================
+
+WEB_LOCK = threading.Lock()
+SESS_LOCK = threading.Lock()
+SESSIONS = {}
+FAILS = {}
+SESSION_TTL = 12 * 3600
+MAX_FAILS = 5
+LOCK_SECONDS = 600
+MAX_BODY = 2 * 1024 * 1024
+WEB_CERT = BASE + "/web.crt"
+WEB_KEY = BASE + "/web.key"
+DEFAULT_WEB_PORT = 2096
+
+
+def hash_password(pw, salt=None, iters=200000):
+    salt = salt or os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, iters)
+    return {"salt": salt.hex(), "hash": h.hex(), "iter": iters}
+
+
+def check_password(pw, web):
+    try:
+        salt = bytes.fromhex(web["salt"])
+        h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, int(web["iter"]))
+        return hmac.compare_digest(h.hex().encode(), str(web["hash"]).encode())
+    except Exception:
+        return False
+
+
+def new_session(ip):
+    sid, csrf = secrets.token_hex(32), secrets.token_hex(16)
+    now = time.time()
+    with SESS_LOCK:
+        for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
+            del SESSIONS[k]
+        SESSIONS[sid] = {"csrf": csrf, "exp": now + SESSION_TTL, "ip": ip}
+    return sid, csrf
+
+
+def get_session(sid):
+    if not sid:
+        return None
+    with SESS_LOCK:
+        s = SESSIONS.get(sid)
+        if s and s["exp"] > time.time():
+            return s
+        SESSIONS.pop(sid, None)
+    return None
+
+
+def login_locked(ip):
+    """返回还需等待的秒数，0 表示未被锁定"""
+    now = time.time()
+    with SESS_LOCK:
+        f = FAILS.get(ip)
+        if not f:
+            return 0
+        if f[0] >= MAX_FAILS:
+            left = LOCK_SECONDS - (now - f[1])
+            if left > 0:
+                return int(left) + 1
+            FAILS.pop(ip, None)
+        elif now - f[1] >= LOCK_SECONDS:
+            FAILS.pop(ip, None)
+    return 0
+
+
+def login_fail(ip):
+    now = time.time()
+    with SESS_LOCK:
+        f = FAILS.get(ip)
+        if not f or (f[0] < MAX_FAILS and now - f[1] >= LOCK_SECONDS):
+            f = [0, now]
+        f[0] += 1
+        if f[0] >= MAX_FAILS:
+            f[1] = now          # 从触发锁定的这一刻开始计时
+        FAILS[ip] = f
+
+
+def login_ok(ip):
+    with SESS_LOCK:
+        FAILS.pop(ip, None)
+
+
+def qr_svg(data):
+    """生成二维码 SVG：优先 segno（Windows 版自带），其次 qrencode 命令；都没有则返回 None"""
+    try:
+        import segno
+        buf = io.BytesIO()
+        segno.make(data, error="m").save(buf, kind="svg", scale=4, border=2)
+        return buf.getvalue().decode("utf-8")
+    except Exception:
+        pass
+    if shutil.which("qrencode"):
+        r = run(["qrencode", "-t", "SVG", "-o", "-", "-m", "2", data])
+        if r is not None and r.returncode == 0 and "<svg" in r.stdout:
+            return r.stdout
+    return None
+
+
+def kid_of(key):
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def web_state():
+    cfg = load_cfg()
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    groups, total = [], 0
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        nodes = [{"tag": t, "kid": kid_of(k), "renamed": k in s["renames"]}
+                 for t, k in zip(r.get("tags", []), r.get("keys", []))]
+        total += r.get("count", 0)
+        groups.append({"id": s["id"], "name": s["name"], "label": source_label(s, idx), "urls": s["urls"],
+                       "links": len(s["links"]), "count": r.get("count", 0),
+                       "status": r.get("status", "未刷新"), "nodes": nodes})
+    return {"version": VERSION, "ip": cfg.get("ip", ""), "port": cfg.get("port"),
+            "interval": cfg.get("interval_hours", 3), "nodes": total, "groups": groups,
+            "ready": os.path.exists(OUT_DIR + "/sub_b64.txt"),
+            "links": [{"title": t, "url": u} for t, u, _ in url_list(cfg)]}
+
+
+def web_preview(text):
+    lines = [l.strip() for l in text.replace("\r", "").split("\n") if l.strip()][:3000]
+    urls, links, unknown = classify_lines(lines)
+    known = {u for x in load_sources() for u in x["urls"]}
+    items, seen = [], set()
+    for url in urls[:20]:
+        if url in seen:
+            continue
+        seen.add(url)
+        it = {"kind": "url", "value": url}
+        if url in known:
+            it["error"] = "这个订阅地址已经添加过了"
+        else:
+            try:
+                nodes, used, skipped = fetch_url_nodes(url)
+                it.update({"count": len(nodes), "types": summarize(nodes),
+                           "used": used if used != url else "",
+                           "skipped": [[a, b] for a, b in skipped[:20]]})
+            except Exception as e:
+                it["error"] = "拉取失败: %s" % e
+        items.append(it)
+    if links:
+        good, nodes_all, skipped = [], [], []
+        for ln in links:
+            n1, s1 = parse_lines([ln])
+            if n1:
+                good.append(ln)
+                nodes_all.extend(n1)
+            else:
+                skipped.extend(s1)
+        if good:
+            items.append({"kind": "links", "value": good, "count": len(nodes_all),
+                          "types": summarize(nodes_all), "skipped": [[a, b] for a, b in skipped[:20]]})
+        else:
+            items.append({"kind": "links", "value": [], "error": "没有识别到有效的节点链接",
+                          "skipped": [[a, b] for a, b in skipped[:20]]})
+    return {"items": items, "unknown": [(u[:50] + ("…" if len(u) > 50 else "")) for u in unknown[:20]]}
+
+
+def web_commit(items):
+    if not isinstance(items, list) or not items or len(items) > 50:
+        raise ValueError("没有可添加的内容")
+    sources = load_sources()
+    errors, added = [], 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip()
+        if name:
+            name = clean_name(name, 30)
+            if name is None:
+                errors.append("节点组名称无效（不能含换行，最长 30 个字符）")
+                continue
+        if it.get("kind") == "url":
+            url = str(it.get("value", "")).strip()
+            if not re.match(r"^https?://", url, re.I) or len(url) > 2000:
+                errors.append("订阅地址格式不对")
+                continue
+            merge_into_sources(sources, name, urls=[url])
+            added += 1
+        elif it.get("kind") == "links":
+            raw = it.get("value")
+            if not isinstance(raw, list) or len(raw) > 5000:
+                errors.append("节点链接格式不对")
+                continue
+            good = [str(l).strip() for l in raw if str(l).strip() and parse_lines([str(l).strip()])[0]]
+            if not good:
+                errors.append("没有有效的节点链接")
+                continue
+            merge_into_sources(sources, name, links=good)
+            added += 1
+    if added:
+        save_sources(sources)
+    n = do_refresh(verbose=False) if added else 0
+    return {"nodes": n, "added": added, "errors": errors}
+
+
+def delete_source_cache(s):
+    try:
+        for fn in os.listdir(CACHE_DIR):
+            if fn == s["id"] + ".json" or fn.startswith(s["id"] + "-"):
+                os.unlink(os.path.join(CACHE_DIR, fn))
+    except Exception:
+        pass
+
+
+def web_group_rename(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("id")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    new = (b.get("name") or "").strip()
+    if new:
+        new = clean_name(new, 30)
+        if new is None:
+            raise ValueError("名称无效（不能含换行，最长 30 个字符）")
+        if any(o is not s and o["name"].lower() == new.lower() for o in sources):
+            raise ValueError("已有其他节点组叫这个名字")
+    s["name"] = new
+    save_sources(sources)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_group_delete(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("id")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    sources.remove(s)
+    save_sources(sources)
+    delete_source_cache(s)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_node_rename(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("group")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    r = read_json(REPORT_FILE, {}).get(s["id"], {})
+    key = next((k for k in r.get("keys", []) if kid_of(k) == b.get("kid")), None)
+    if key is None:
+        raise ValueError("找不到这个节点，请刷新后重试")
+    new = (b.get("name") or "").strip()
+    if not new:
+        s["renames"].pop(key, None)
+    else:
+        name = clean_name(new, 60)
+        if name is None:
+            raise ValueError("名称无效（不能含换行，最长 60 个字符）")
+        if name in RESERVED_TAGS or name in {x["tag"] for x in load_services()}:
+            raise ValueError("这个名称是系统保留的分组名，请换一个")
+        s["renames"][key] = name
+    save_sources(sources)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_settings(b):
+    try:
+        h = int(b.get("interval"))
+    except (TypeError, ValueError):
+        raise ValueError("刷新间隔必须是 1-168 之间的整数")
+    if not (1 <= h <= 168):
+        raise ValueError("刷新间隔必须是 1-168 之间的整数")
+    cfg = load_cfg()
+    cfg["interval_hours"] = h
+    save_cfg(cfg)
+    try:
+        write_units(cfg)
+        sc("restart", "msub-refresh.timer")
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def web_new_token():
+    cfg = load_cfg()
+    cfg["token"] = os.urandom(8).hex()
+    save_cfg(cfg)
+    return {"ok": True}
+
+
+def web_change_password(b, keep_sid):
+    cfg = load_cfg()
+    web = cfg.get("web") or {}
+    if not check_password(str(b.get("old", "")), web):
+        raise ValueError("当前密码不正确")
+    new = str(b.get("new", ""))
+    if len(new) < 8:
+        raise ValueError("新密码至少 8 位")
+    web.update(hash_password(new))
+    cfg["web"] = web
+    save_cfg(cfg)
+    with SESS_LOCK:                      # 其他已登录的会话全部作废
+        for k in [k for k in SESSIONS if k != keep_sid]:
+            del SESSIONS[k]
+    return {"ok": True}
+
+
+class AdminHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "msub"
+    sys_version = ""
+    timeout = 30
+
+    def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(10)
+            self.request.do_handshake()
+        http.server.BaseHTTPRequestHandler.setup(self)
+
+    def log_message(self, fmt, *args):
+        return
+
+    # ---- 工具 ----
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj, headers=None):
+        self._send(code, json.dumps(obj, ensure_ascii=False), headers=headers)
+
+    def _sid(self):
+        c = http.cookies.SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        m = c.get("msub_sid")
+        return m.value if m else ""
+
+    def _is_tls(self):
+        return isinstance(self.request, ssl.SSLSocket)
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        return urllib.parse.urlsplit(origin).netloc == self.headers.get("Host", "")
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            raise ValueError("请求内容过大或格式不对")
+        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            obj = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            raise ValueError("请求格式错误")
+        if not isinstance(obj, dict):
+            raise ValueError("请求格式错误")
+        return obj
+
+    # ---- GET ----
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        path, query = u.path, urllib.parse.parse_qs(u.query)
+        if path == "/":
+            return self._send(302, b"", headers={"Location": "/admin"})
+        if path in ("/admin", "/admin/"):
+            nonce = secrets.token_urlsafe(16)
+            csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; img-src 'self' blob: data:; "
+                   "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" % (nonce, nonce))
+            return self._send(200, ADMIN_HTML.replace("__NONCE__", nonce), "text/html; charset=utf-8",
+                              {"Content-Security-Policy": csp})
+        if not path.startswith("/admin/api/"):
+            return self._json(404, {"error": "not found"})
+        s = get_session(self._sid())
+        if path == "/admin/api/session":
+            return self._json(200, {"authed": bool(s), "csrf": s["csrf"] if s else ""})
+        if not s:
+            return self._json(401, {"error": "未登录"})
+        if path == "/admin/api/state":
+            return self._json(200, web_state())
+        if path == "/admin/api/qr":
+            items = url_list(load_cfg())
+            try:
+                kind = int(query.get("kind", ["-1"])[0])
+                data = items[kind][2]
+            except (ValueError, IndexError):
+                return self._json(400, {"error": "参数错误"})
+            svg = qr_svg(data)
+            if svg is None:
+                return self._json(501, {"error": "服务器没有二维码工具。请在服务器运行 msub 选择「订阅二维码」自动安装，或执行 apt install qrencode"})
+            return self._send(200, svg, "image/svg+xml; charset=utf-8")
+        self._json(404, {"error": "not found"})
+
+    # ---- POST ----
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if not self._origin_ok():
+            return self._json(403, {"error": "请求来源不合法"})
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        if path == "/admin/api/login":
+            return self._login(body)
+        sid = self._sid()
+        s = get_session(sid)
+        if not s:
+            return self._json(401, {"error": "未登录"})
+        tok = self.headers.get("X-CSRF-Token", "")
+        if not hmac.compare_digest(tok.encode("utf-8", "ignore"), s["csrf"].encode()):
+            return self._json(403, {"error": "安全校验失败，请刷新页面后重试"})
+        try:
+            with WEB_LOCK:
+                result = self._dispatch(path, body, sid)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except Exception as e:
+            return self._json(500, {"error": "服务器内部错误: %s" % e})
+        if result is None:
+            return self._json(404, {"error": "not found"})
+        self._json(200, result)
+
+    def _login(self, body):
+        ip = self.client_address[0]
+        wait = login_locked(ip)
+        if wait:
+            return self._json(429, {"error": "尝试次数过多，请 %d 分钟后再试" % (wait // 60 + 1)})
+        web = load_cfg().get("web") or {}
+        if not web.get("enabled") or not web.get("hash"):
+            return self._json(403, {"error": "网页管理未开启"})
+        if check_password(str(body.get("password", "")), web):
+            login_ok(ip)
+            sid, csrf = new_session(ip)
+            cookie = "msub_sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (
+                sid, SESSION_TTL, "; Secure" if self._is_tls() else "")
+            return self._json(200, {"ok": True, "csrf": csrf}, headers={"Set-Cookie": cookie})
+        login_fail(ip)
+        time.sleep(0.8)
+        return self._json(401, {"error": "密码错误"})
+
+    def _dispatch(self, path, b, sid):
+        if not path.startswith("/admin/api/"):
+            return None
+        p = path[len("/admin/api/"):]
+        if p == "logout":
+            with SESS_LOCK:
+                SESSIONS.pop(sid, None)
+            return {"ok": True}
+        if p == "add/preview":
+            return web_preview(str(b.get("text", "")))
+        if p == "add/commit":
+            return web_commit(b.get("items"))
+        if p == "group/rename":
+            return web_group_rename(b)
+        if p == "group/delete":
+            return web_group_delete(b)
+        if p == "node/rename":
+            return web_node_rename(b)
+        if p == "refresh":
+            return {"nodes": do_refresh(verbose=False)}
+        if p == "settings":
+            return web_settings(b)
+        if p == "token":
+            return web_new_token()
+        if p == "password":
+            return web_change_password(b, sid)
+        return None
+
+
+class TLSServer(Server):
+    ctx = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+def ensure_web_cert(ip):
+    if os.path.exists(WEB_CERT) and os.path.exists(WEB_KEY):
+        return True
+    if not shutil.which("openssl"):
+        return False
+    san = "IP:%s" % ip if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip or "") else "DNS:localhost"
+    r = run(["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048", "-keyout", WEB_KEY, "-out", WEB_CERT,
+             "-days", "3650", "-subj", "/CN=msub", "-addext", "subjectAltName=" + san])
+    if r is None or r.returncode != 0 or not os.path.exists(WEB_CERT):
+        return False
+    os.chmod(WEB_KEY, 0o600)
+    return True
+
+
+def make_admin_server(web):
+    port = int(web["port"])
+    if web.get("https") and os.path.exists(WEB_CERT) and os.path.exists(WEB_KEY):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(WEB_CERT, WEB_KEY)
+        srv = TLSServer(("", port), AdminHandler)
+        srv.ctx = ctx
+        return srv
+    return Server(("", port), AdminHandler)
+
+
+def web_url(cfg):
+    web = cfg.get("web") or {}
+    return "%s://%s:%s/admin" % ("https" if web.get("https") else "http", cfg.get("ip", "你的IP"), web.get("port", DEFAULT_WEB_PORT))
+
+
+def ask_secret(prompt):
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def web_enable(cfg):
+    web = dict(cfg.get("web") or {})
+    pw = ask_secret("设置网页登录密码（至少 8 位，输入时不显示）: ")
+    if len(pw) < 8:
+        print("❌ 密码至少 8 位。")
+        return
+    if ask_secret("再输入一次: ") != pw:
+        print("❌ 两次输入不一致。")
+        return
+    cur_port = web.get("port")
+    while True:
+        v = ask("网页管理端口 [直接回车使用 %s]: " % (cur_port or DEFAULT_WEB_PORT), str(cur_port or DEFAULT_WEB_PORT))
+        if not (v.isdigit() and 1 <= int(v) <= 65535):
+            print("❌ 端口必须是 1-65535 之间的数字。")
+            continue
+        if int(v) == int(cfg.get("port", 0)):
+            print("❌ 不能和订阅端口相同。")
+            continue
+        if cur_port and int(v) == int(cur_port) and web.get("enabled"):
+            break
+        if not port_free(int(v)):
+            print("❌ 端口 %s 已被占用，请换一个。" % v)
+            continue
+        break
+    web.update(hash_password(pw))
+    web["port"] = int(v)
+    web["enabled"] = True
+    if web.get("https", True):
+        if ensure_web_cert(cfg.get("ip", "")):
+            web["https"] = True
+        else:
+            web["https"] = False
+            print("⚠️  没有 openssl，无法生成证书，网页管理将使用 HTTP（密码会明文传输）。")
+    old_port = int(cur_port) if cur_port else None
+    cfg["web"] = web
+    save_cfg(cfg)
+    open_firewall(int(v))
+    if old_port and old_port != int(v):
+        close_firewall(old_port)
+    sc("restart", "msub-web")
+    print("✅ 网页管理已开启: %s" % web_url(cfg))
+    if web["https"]:
+        print("ℹ️  使用自签名证书，浏览器第一次会提示「不安全」，选择继续访问即可，传输内容仍是加密的。")
+    print("⚠️  请在云安全组放行 TCP %s。" % v)
+
+
+def web_menu():
+    cfg = ensure_cfg()
+    while True:
+        cfg = load_cfg()
+        web = cfg.get("web") or {}
+        on = bool(web.get("enabled") and web.get("hash"))
+        print(LINE)
+        print("  网页管理界面（用手机或电脑浏览器管理节点、查看订阅和二维码）")
+        print("  状态: %s" % (("已开启    地址: " + web_url(cfg)) if on else "未开启"))
+        print("  1. %s" % ("重新设置密码 / 端口" if on else "开启（设置密码和端口）"))
+        print("  2. 关闭")
+        print("  3. 切换 HTTPS（当前: %s）" % ("开" if web.get("https") else "关"))
+        print("  0. 返回")
+        print(LINE)
+        c = ask("请选择 [0-3]: ", "0")
+        if c == "1":
+            web_enable(cfg)
+        elif c == "2":
+            if on:
+                web["enabled"] = False
+                cfg["web"] = web
+                save_cfg(cfg)
+                if web.get("port"):
+                    close_firewall(int(web["port"]))
+                sc("restart", "msub-web")
+                print("✅ 网页管理已关闭。")
+            else:
+                print("ℹ️  本来就是关闭的。")
+        elif c == "3":
+            if not web.get("hash"):
+                print("ℹ️  请先开启网页管理。")
+                continue
+            if web.get("https"):
+                web["https"] = False
+                print("⚠️  已切换为 HTTP，登录密码将明文传输，仅建议在可信网络下使用。")
+            elif ensure_web_cert(cfg.get("ip", "")):
+                web["https"] = True
+                print("✅ 已切换为 HTTPS（自签名证书）。")
+            else:
+                print("❌ 没有 openssl，无法生成证书。")
+                continue
+            cfg["web"] = web
+            save_cfg(cfg)
+            sc("restart", "msub-web")
+            print("   地址: %s" % web_url(cfg))
+        else:
+            return
+
+
+
+ADMIN_HTML = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex,nofollow">
+<title>msub 管理</title>
+<style nonce="__NONCE__">
+:root{--bg:#f5f6f8;--card:#fff;--text:#1d2129;--muted:#6b7280;--accent:#2563eb;--danger:#dc2626;--border:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111827;--card:#1f2937;--text:#f3f4f6;--muted:#9ca3af;--accent:#60a5fa;--danger:#f87171;--border:#374151}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+header b{flex:1}
+nav{display:flex;gap:6px;padding:10px 14px;overflow-x:auto;max-width:900px;margin:0 auto}
+main{padding:0 14px 48px;max-width:900px;margin:0 auto}
+h2,h3{margin:0 0 8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px}
+.narrow{max-width:420px;margin:48px auto}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.spread{justify-content:space-between}
+.muted{color:var(--muted)}
+.err{color:var(--danger)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+.small{font-size:13px}
+button{font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;white-space:nowrap}
+button.ghost{background:transparent;color:var(--accent)}
+button.danger{background:transparent;color:var(--danger);border-color:var(--danger)}
+button.small{padding:3px 9px;font-size:13px}
+button:disabled{opacity:.6;cursor:default}
+.tab{background:transparent;color:var(--text);border-color:var(--border)}
+.tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+input[type=text],input[type=password],input[type=number],textarea{font:inherit;width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)}
+input[type=number]{width:90px}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+details summary{cursor:pointer;margin:8px 0}
+.node{padding:3px 0;border-bottom:1px dashed var(--border)}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 16px;border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw;z-index:30}
+#toast.show{opacity:.95}
+#toast.err{background:#b91c1c}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20}
+.overlay[hidden]{display:none}
+.overlay .card{margin:0;text-align:center}
+#qrImg{width:260px;max-width:70vw;background:#fff;padding:8px;border-radius:8px}
+.offscreen{position:fixed;left:-9999px;top:0}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="login" class="card narrow" hidden>
+  <h2>msub 管理登录</h2>
+  <input id="pw" type="password" placeholder="登录密码" autocomplete="current-password">
+  <div class="row"><button id="loginBtn">登录</button></div>
+  <p id="loginErr" class="err"></p>
+</div>
+
+<div id="app" hidden>
+  <header><b>msub 订阅合并工具 <small id="ver" class="muted"></small></b><button id="logoutBtn" class="ghost small">退出登录</button></header>
+  <nav>
+    <button class="tab active" data-tab="links">订阅链接</button>
+    <button class="tab" data-tab="groups">节点组</button>
+    <button class="tab" data-tab="add">添加节点</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
+  <main>
+    <section id="tab-links"></section>
+    <section id="tab-groups" hidden></section>
+    <section id="tab-add" hidden>
+      <div class="card">
+        <p class="muted">粘贴订阅地址或节点链接（可混合、多行），然后点「检查」。</p>
+        <textarea id="addText" rows="7" spellcheck="false" placeholder="https://其他VPS的订阅地址&#10;vless://...&#10;hysteria2://..."></textarea>
+        <div class="row"><button id="addCheck">检查</button></div>
+      </div>
+      <datalist id="groupNames"></datalist>
+      <div id="addResult"></div>
+    </section>
+    <section id="tab-settings" hidden>
+      <div class="card" id="infoCard"></div>
+      <div class="card">
+        <h3>自动刷新</h3>
+        <div class="row"><span>每</span><input id="interval" type="number" min="1" max="168"><span>小时刷新一次</span><button id="saveInterval">保存</button></div>
+        <div class="row"><button id="refreshBtn" class="ghost">立即刷新</button><button id="tokenBtn" class="danger">更换订阅 token</button></div>
+      </div>
+      <div class="card">
+        <h3>修改网页登录密码</h3>
+        <input id="oldPw" type="password" placeholder="当前密码" autocomplete="current-password">
+        <div class="row"><input id="newPw" type="password" placeholder="新密码（至少 8 位）" autocomplete="new-password"></div>
+        <div class="row"><button id="pwBtn">修改密码</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+<div id="qrBox" class="overlay" hidden>
+  <div class="card narrow">
+    <h3 id="qrTitle"></h3>
+    <img id="qrImg" alt="二维码">
+    <p id="qrMsg" class="muted"></p>
+    <button id="qrClose">关闭</button>
+  </div>
+</div>
+
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+  var csrf = "";
+  var state = null;
+  var pendingItems = [];
+  var toastTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+  function clear(n) { while (n.firstChild) { n.removeChild(n.firstChild); } }
+  function el(tag, props, kids) {
+    var e = document.createElement(tag);
+    var k;
+    props = props || {};
+    for (k in props) {
+      if (!Object.prototype.hasOwnProperty.call(props, k)) { continue; }
+      if (k === "class") { e.className = props[k]; }
+      else if (k === "text") { e.textContent = props[k]; }
+      else if (k.slice(0, 2) === "on") { e.addEventListener(k.slice(2), props[k]); }
+      else { e.setAttribute(k, props[k]); }
+    }
+    (kids || []).forEach(function (c) {
+      if (c === null || c === undefined) { return; }
+      e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return e;
+  }
+  function toast(msg, isErr) {
+    var t = $("toast");
+    t.textContent = msg;
+    t.className = "show" + (isErr ? " err" : "");
+    if (toastTimer) { clearTimeout(toastTimer); }
+    toastTimer = setTimeout(function () { t.className = ""; }, 3500);
+  }
+  function fail(e) { toast(e && e.message ? e.message : "操作失败", true); }
+
+  function api(method, path, body) {
+    var opt = { method: method, headers: {}, credentials: "same-origin" };
+    if (method !== "GET") {
+      opt.headers["Content-Type"] = "application/json";
+      opt.headers["X-CSRF-Token"] = csrf;
+      opt.body = JSON.stringify(body || {});
+    }
+    return fetch("/admin/api/" + path, opt).then(function (r) {
+      return r.json().then(function (j) { return { r: r, j: j }; },
+        function () { return { r: r, j: { error: "服务器返回了无法识别的内容" } }; });
+    }).then(function (x) {
+      if (x.r.status === 401 && path !== "login") { showLogin(); throw new Error("登录已过期，请重新登录"); }
+      if (!x.r.ok || x.j.error) { throw new Error(x.j.error || ("请求失败 " + x.r.status)); }
+      return x.j;
+    });
+  }
+
+  function showLogin() { $("app").hidden = true; $("login").hidden = false; $("pw").value = ""; }
+  function showApp() { $("login").hidden = true; $("app").hidden = false; return loadState(); }
+  function loadState() {
+    return api("GET", "state").then(function (j) { state = j; renderAll(); }).catch(fail);
+  }
+  function showTab(name) {
+    ["links", "groups", "add", "settings"].forEach(function (t) { $("tab-" + t).hidden = (t !== name); });
+    var tabs = document.querySelectorAll(".tab");
+    var i;
+    for (i = 0; i < tabs.length; i++) {
+      tabs[i].classList.toggle("active", tabs[i].getAttribute("data-tab") === name);
+    }
+  }
+
+  function copyText(text) {
+    function fallback() {
+      var ta = el("textarea", {});
+      ta.value = text;
+      ta.className = "offscreen";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      toast(ok ? "已复制" : "复制失败，请长按选中后手动复制", !ok);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { toast("已复制"); }, fallback);
+    } else { fallback(); }
+  }
+
+  function showQr(i, title) {
+    $("qrTitle").textContent = title;
+    $("qrMsg").textContent = "加载中…";
+    $("qrImg").removeAttribute("src");
+    $("qrBox").hidden = false;
+    fetch("/admin/api/qr?kind=" + i, { credentials: "same-origin" }).then(function (r) {
+      var ct = r.headers.get("Content-Type") || "";
+      if (ct.indexOf("svg") >= 0) {
+        return r.text().then(function (svg) {
+          $("qrImg").src = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+          $("qrMsg").textContent = "用客户端扫描二维码导入";
+        });
+      }
+      return r.json().then(function (j) { $("qrMsg").textContent = j.error || "获取二维码失败"; });
+    }).catch(function (e) { $("qrMsg").textContent = e.message; });
+  }
+
+  /* ---------- 订阅链接 ---------- */
+  function renderLinks() {
+    var box = $("tab-links");
+    clear(box);
+    if (!state.ready) {
+      box.appendChild(el("p", { "class": "muted", text: "还没有可用订阅，请先到「添加节点」页面添加。" }));
+      return;
+    }
+    box.appendChild(el("p", { "class": "muted", text: "订阅链接含全部节点密码，请勿公开分享。" }));
+    state.links.forEach(function (it, i) {
+      box.appendChild(el("div", { "class": "card" }, [
+        el("b", { text: it.title }),
+        el("div", { "class": "mono small", text: it.url }),
+        el("div", { "class": "row" }, [
+          el("button", { text: "复制", onclick: function () { copyText(it.url); } }),
+          el("button", { "class": "ghost", text: "二维码", onclick: function () { showQr(i, it.title); } })
+        ])
+      ]));
+    });
+  }
+
+  /* ---------- 节点组 ---------- */
+  function renameGroup(g) {
+    var v = window.prompt("新的节点组名称（留空 = 不加前缀）", g.name);
+    if (v === null) { return; }
+    api("POST", "group/rename", { id: g.id, name: v }).then(function () { toast("已改名"); return loadState(); }).catch(fail);
+  }
+  function deleteGroup(g) {
+    if (!window.confirm("确定删除节点组「" + g.label + "」及其所有节点吗？")) { return; }
+    api("POST", "group/delete", { id: g.id }).then(function () { toast("已删除"); return loadState(); }).catch(fail);
+  }
+  function renameNode(g, n) {
+    var v = window.prompt("新的节点名称（留空 = 恢复默认名称）", n.tag);
+    if (v === null) { return; }
+    api("POST", "node/rename", { group: g.id, kid: n.kid, name: v }).then(function () { toast("已改名"); return loadState(); }).catch(fail);
+  }
+  function renderGroups() {
+    var box = $("tab-groups");
+    clear(box);
+    if (!state.groups.length) {
+      box.appendChild(el("p", { "class": "muted", text: "还没有节点组，请先到「添加节点」页面添加。" }));
+      return;
+    }
+    state.groups.forEach(function (g) {
+      var parts = [];
+      if (g.urls.length) { parts.push("订阅地址 " + g.urls.length + " 个"); }
+      if (g.links) { parts.push("粘贴节点 " + g.links + " 条"); }
+      var card = el("div", { "class": "card" }, [
+        el("div", { "class": "row spread" }, [
+          el("b", { text: g.label }),
+          el("span", { "class": "muted", text: "节点 " + g.count + " 个" })
+        ]),
+        el("div", { "class": "muted small", text: parts.join(" + ") + " · " + g.status })
+      ]);
+      g.urls.forEach(function (u) { card.appendChild(el("div", { "class": "mono small muted", text: u })); });
+      var det = el("details", {}, [el("summary", { text: "查看节点 (" + g.nodes.length + ")" })]);
+      g.nodes.forEach(function (n) {
+        det.appendChild(el("div", { "class": "row spread node" }, [
+          el("span", { text: n.tag + (n.renamed ? "  ✎" : "") }),
+          el("button", { "class": "ghost small", text: "改名", onclick: function () { renameNode(g, n); } })
+        ]));
+      });
+      card.appendChild(det);
+      card.appendChild(el("div", { "class": "row" }, [
+        el("button", { "class": "ghost", text: "改节点组名称", onclick: function () { renameGroup(g); } }),
+        el("button", { "class": "danger", text: "删除节点组", onclick: function () { deleteGroup(g); } })
+      ]));
+      box.appendChild(card);
+    });
+  }
+
+  /* ---------- 添加节点 ---------- */
+  function renderAddNames() {
+    var dl = $("groupNames");
+    clear(dl);
+    state.groups.forEach(function (g) { if (g.name) { dl.appendChild(el("option", { value: g.name })); } });
+  }
+  function showPreview(j) {
+    var box = $("addResult");
+    clear(box);
+    (j.unknown || []).forEach(function (u) {
+      box.appendChild(el("p", { "class": "muted small", text: "无法识别，已忽略：" + u }));
+    });
+    if (!j.items.length) {
+      box.appendChild(el("p", { "class": "err", text: "没有识别到任何订阅地址或节点链接。" }));
+      return;
+    }
+    var any = false;
+    j.items.forEach(function (it) {
+      var title = it.kind === "url" ? it.value : "粘贴的节点链接";
+      var card = el("div", { "class": "card" }, [el("div", { "class": "mono small", text: title })]);
+      if (it.error) {
+        card.appendChild(el("div", { "class": "err", text: it.error }));
+      } else {
+        any = true;
+        card.appendChild(el("div", { text: "解析到 " + it.count + " 个节点：" + (it.types || "") }));
+        if (it.used) { card.appendChild(el("div", { "class": "muted small", text: "已自动改用更完整的地址：" + it.used })); }
+        (it.skipped || []).forEach(function (s) {
+          card.appendChild(el("div", { "class": "muted small", text: "跳过：" + s[0] + "（" + s[1] + "）" }));
+        });
+        var nameEl = el("input", { type: "text", list: "groupNames", placeholder: "节点组名称，如 US（选已有名称=并入；留空=不加前缀）" });
+        var chk = el("input", { type: "checkbox", checked: "checked" });
+        it._nameEl = nameEl;
+        it._chkEl = chk;
+        card.appendChild(el("div", { "class": "row" }, [el("label", {}, [chk, " 添加"])]));
+        card.appendChild(el("div", { "class": "row" }, [nameEl]));
+      }
+      box.appendChild(card);
+    });
+    if (any) { box.appendChild(el("div", { "class": "row" }, [el("button", { id: "commitBtn", text: "生成合并链接", onclick: commitAdd })])); }
+  }
+  function checkAdd() {
+    var text = $("addText").value;
+    if (!text.trim()) { toast("请先粘贴内容", true); return; }
+    $("addCheck").disabled = true;
+    $("addCheck").textContent = "检查中…";
+    api("POST", "add/preview", { text: text }).then(function (j) {
+      pendingItems = j.items;
+      showPreview(j);
+    }).catch(fail).then(function () {
+      $("addCheck").disabled = false;
+      $("addCheck").textContent = "检查";
+    });
+  }
+  function commitAdd() {
+    var items = [];
+    pendingItems.forEach(function (it) {
+      if (it.error || !it._chkEl || !it._chkEl.checked) { return; }
+      items.push({ kind: it.kind, value: it.value, name: it._nameEl.value.trim() });
+    });
+    if (!items.length) { toast("没有可添加的内容", true); return; }
+    var btn = $("commitBtn");
+    if (btn) { btn.disabled = true; }
+    api("POST", "add/commit", { items: items }).then(function (j) {
+      var msg = "已合并，共 " + j.nodes + " 个节点";
+      if (j.errors && j.errors.length) { msg += "（" + j.errors.length + " 项未添加）"; }
+      toast(msg, !!(j.errors && j.errors.length));
+      $("addText").value = "";
+      clear($("addResult"));
+      pendingItems = [];
+      return loadState().then(function () { showTab("links"); });
+    }).catch(fail).then(function () { if (btn) { btn.disabled = false; } });
+  }
+
+  /* ---------- 设置 ---------- */
+  function renderSettings() {
+    var box = $("infoCard");
+    clear(box);
+    box.appendChild(el("h3", { text: "运行信息" }));
+    [["脚本版本", "v" + state.version], ["服务器 IP", state.ip], ["订阅端口", String(state.port)],
+     ["节点总数", String(state.nodes)], ["节点组数", String(state.groups.length)]].forEach(function (p) {
+      box.appendChild(el("div", { "class": "row spread" }, [el("span", { "class": "muted", text: p[0] }), el("span", { text: p[1] })]));
+    });
+    $("interval").value = state.interval;
+  }
+
+  function renderAll() {
+    $("ver").textContent = "v" + state.version;
+    renderLinks();
+    renderGroups();
+    renderAddNames();
+    renderSettings();
+  }
+
+  function doLogin() {
+    api("POST", "login", { password: $("pw").value }).then(function (j) {
+      csrf = j.csrf;
+      $("loginErr").textContent = "";
+      return showApp();
+    }).catch(function (e) { $("loginErr").textContent = e.message; });
+  }
+
+  function bind() {
+    $("loginBtn").addEventListener("click", doLogin);
+    $("pw").addEventListener("keydown", function (e) { if (e.key === "Enter") { doLogin(); } });
+    $("logoutBtn").addEventListener("click", function () {
+      api("POST", "logout", {}).catch(function () { return null; }).then(showLogin);
+    });
+    var tabs = document.querySelectorAll(".tab");
+    var i;
+    for (i = 0; i < tabs.length; i++) {
+      (function (b) { b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); }); })(tabs[i]);
+    }
+    $("addCheck").addEventListener("click", checkAdd);
+    $("qrClose").addEventListener("click", function () { $("qrBox").hidden = true; });
+    $("saveInterval").addEventListener("click", function () {
+      api("POST", "settings", { interval: parseInt($("interval").value, 10) }).then(function () { toast("已保存"); return loadState(); }).catch(fail);
+    });
+    $("refreshBtn").addEventListener("click", function () {
+      toast("正在刷新…");
+      api("POST", "refresh", {}).then(function (j) { toast("刷新完成，共 " + j.nodes + " 个节点"); return loadState(); }).catch(fail);
+    });
+    $("tokenBtn").addEventListener("click", function () {
+      if (!window.confirm("更换后所有订阅链接都会变化，已导入客户端的订阅需要重新添加。确定吗？")) { return; }
+      api("POST", "token", {}).then(function () { toast("订阅 token 已更换"); return loadState(); }).catch(fail);
+    });
+    $("pwBtn").addEventListener("click", function () {
+      api("POST", "password", { old: $("oldPw").value, "new": $("newPw").value }).then(function () {
+        $("oldPw").value = "";
+        $("newPw").value = "";
+        toast("密码已修改");
+      }).catch(fail);
+    });
+  }
+
+  function start() {
+    bind();
+    api("GET", "session").then(function (j) {
+      if (j.authed) { csrf = j.csrf; return showApp(); }
+      showLogin();
+      return null;
+    }).catch(function () { showLogin(); });
+  }
+  start();
+})();
+</script>
+</body>
+</html>
+'''
+
+
 def do_serve():
     cfg = load_cfg()
     if not cfg:
         die("❌ 尚未初始化。")
+    web = cfg.get("web") or {}
+    if web.get("enabled") and web.get("hash"):
+        try:
+            adm = make_admin_server(web)
+            threading.Thread(target=adm.serve_forever, daemon=True).start()
+        except Exception as e:
+            print("网页管理启动失败: %s" % e, flush=True)
     Server(("", int(cfg["port"])), Handler).serve_forever()
 
 
@@ -1974,12 +3050,7 @@ def remove_source(arg=None):
         return
     s = sources.pop(int(v) - 1)
     save_sources(sources)
-    try:
-        for fn in os.listdir(CACHE_DIR):
-            if fn == s["id"] + ".json" or fn.startswith(s["id"] + "-"):
-                os.unlink(os.path.join(CACHE_DIR, fn))
-    except Exception:
-        pass
+    delete_source_cache(s)
     print("✅ 已删除节点组: %s" % source_label(s, int(v) - 1))
     do_refresh()
 
@@ -2067,6 +3138,8 @@ def status():
         b = "http://127.0.0.1:%s/%s" % (cfg.get("port"), cfg.get("token"))
         for p in ("sub", "clash", "singbox", "singbox-cn"):
             print("本机访问 /%-10s -> HTTP %s" % (p, http_code("%s/%s" % (b, p))))
+    web = cfg.get("web") or {}
+    print("网页管理: %s" % (web_url(cfg) if web.get("enabled") and web.get("hash") else "未开启"))
     sources = load_sources()
     report = read_json(REPORT_FILE, {})
     print("节点组数量: %d" % len(sources))
@@ -2189,17 +3262,18 @@ def menu():
         print("  3. 查看合并订阅链接")
         print("  4. 订阅二维码")
         print("  5. 立即刷新")
-        print("  6. 设置（端口 / 刷新间隔 / token / IP / 分流服务）")
-        print("  7. 状态检测")
-        print("  8. 检查并升级本脚本")
-        print("  9. 卸载")
+        print("  6. 网页管理界面（手机 / 电脑浏览器管理）")
+        print("  7. 设置（端口 / 刷新间隔 / token / IP / 分流服务）")
+        print("  8. 状态检测")
+        print("  9. 检查并升级本脚本")
+        print(" 10. 卸载")
         print("  0. 退出")
         print(LINE)
         print(" 💡 快捷命令: 输入 msub 即可打开本菜单")
-        print("    直达: msub add | manage | show | qr | refresh | status | upgrade")
+        print("    直达: msub add | manage | show | qr | web | refresh | status | upgrade")
         print(LINE)
         try:
-            c = input("请输入数字选择 [0-9]: ").strip()
+            c = input("请输入数字选择 [0-10]: ").strip()
         except EOFError:
             return
         cfg = load_cfg()
@@ -2218,12 +3292,14 @@ def menu():
         elif c == "5":
             do_refresh()
         elif c == "6":
-            settings()
+            web_menu()
         elif c == "7":
-            status()
+            settings()
         elif c == "8":
-            upgrade()
+            status()
         elif c == "9":
+            upgrade()
+        elif c == "10":
             uninstall()
         elif c == "0":
             return
@@ -2264,6 +3340,8 @@ def main(argv):
             menu()
     elif cmd == "manage":
         manage_menu()
+    elif cmd == "web":
+        web_menu()
     elif cmd == "add-url":
         add_url(rest[0] if rest else "", rest[1] if len(rest) > 1 else "")
     elif cmd == "add-links":
@@ -2288,7 +3366,7 @@ def main(argv):
         setup()
     else:
         print("未知命令: %s" % cmd)
-        print("可用: add | manage | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
+        print("可用: add | manage | web | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
         sys.exit(1)
 
 
