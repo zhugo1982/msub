@@ -33,12 +33,14 @@ import tempfile
 import threading
 import time
 import urllib.error
+import webbrowser
 import urllib.parse
 import urllib.request
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.5.0  新增便携模式（Windows 绿色版）：双击运行、数据保存在程序旁的 data 文件夹、自动打开网页管理；新增 selftest 自检命令
 # 1.4.0  新增网页管理界面（手机/电脑浏览器管理节点、查看订阅链接和二维码），默认关闭，需设置密码，独立端口，默认 HTTPS；主菜单新增「网页管理界面」（原 6-10 项顺延）
 # 1.3.2  添加节点时可输入 0 返回主菜单或放弃当前项；分流服务支持编辑（追加/删除域名和 IP 段）
 # 1.3.1  菜单与提示里把「来源」统一称为「节点组」（一个节点组对应客户端里的一个分组）
@@ -53,7 +55,28 @@ VERSION = "1.4.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/zhugo1982/msub/refs/heads/main/msub"
 
 BIN_PATH = "/usr/local/bin/msub"
-BASE = "/etc/hugo-merge"
+PORTABLE = bool(os.environ.get("MSUB_PORTABLE")) or sys.platform == "win32" or bool(getattr(sys, "frozen", False))
+
+
+def _portable_base():
+    """便携模式的数据目录: MSUB_HOME，否则程序旁的 data 文件夹，不可写时退到 %APPDATA%/msub"""
+    env = os.environ.get("MSUB_HOME")
+    if env:
+        return env
+    app_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    base = os.path.join(app_dir, "data")
+    try:
+        os.makedirs(base, exist_ok=True)
+        probe = os.path.join(base, ".write-test")
+        with open(probe, "w") as f:
+            f.write("1")
+        os.unlink(probe)
+        return base
+    except Exception:
+        return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "msub")
+
+
+BASE = _portable_base() if PORTABLE else "/etc/hugo-merge"
 CFG_FILE = BASE + "/config.json"
 SRC_FILE = BASE + "/sources.json"
 REPORT_FILE = BASE + "/report.json"
@@ -133,7 +156,14 @@ def write_atomic(path, data, mode=0o600):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        for i in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if i == 4:
+                    raise
+                time.sleep(0.1)
     except Exception:
         try:
             os.unlink(tmp)
@@ -203,7 +233,10 @@ def get_public_ip():
 def port_free(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):          # Windows: 独占绑定才能准确判断端口是否被占用
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", port))
         return True
     except OSError:
@@ -672,6 +705,10 @@ def candidate_urls(url):
     if m:
         return [m.group(1) + "/singbox", m.group(1) + "/sub"]
     return [url.strip()]
+
+
+# 访问本机(127.0.0.1)时不能走系统代理（Windows 上 v2rayN 等设置系统代理后，本机请求会被绕出去）
+LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def http_get(url, timeout=20):
@@ -1269,7 +1306,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    allow_reuse_address = True
+    allow_reuse_address = (os.name != "nt")        # Windows 上允许复用会导致两个实例同时"成功"绑定同一端口
     daemon_threads = True
 
 
@@ -1396,6 +1433,7 @@ def web_state():
     return {"version": VERSION, "ip": cfg.get("ip", ""), "port": cfg.get("port"),
             "interval": cfg.get("interval_hours", 3), "nodes": total, "groups": groups,
             "ready": os.path.exists(OUT_DIR + "/sub_b64.txt"),
+            "portable": PORTABLE, "lan": bool(cfg.get("lan")),
             "links": [{"title": t, "url": u} for t, u, _ in url_list(cfg)]}
 
 
@@ -1540,21 +1578,30 @@ def web_node_rename(b):
 
 
 def web_settings(b):
-    try:
-        h = int(b.get("interval"))
-    except (TypeError, ValueError):
-        raise ValueError("刷新间隔必须是 1-168 之间的整数")
-    if not (1 <= h <= 168):
-        raise ValueError("刷新间隔必须是 1-168 之间的整数")
     cfg = load_cfg()
-    cfg["interval_hours"] = h
+    restart = False
+    if "interval" in b:
+        try:
+            h = int(b.get("interval"))
+        except (TypeError, ValueError):
+            raise ValueError("刷新间隔必须是 1-168 之间的整数")
+        if not (1 <= h <= 168):
+            raise ValueError("刷新间隔必须是 1-168 之间的整数")
+        cfg["interval_hours"] = h
+    if "lan" in b and PORTABLE:
+        lan = bool(b.get("lan"))
+        cfg["lan"] = lan
+        cfg["bind"] = "0.0.0.0" if lan else "127.0.0.1"
+        cfg["ip"] = get_lan_ip() if lan else "127.0.0.1"
+        restart = True
     save_cfg(cfg)
-    try:
-        write_units(cfg)
-        sc("restart", "msub-refresh.timer")
-    except Exception:
-        pass
-    return {"ok": True}
+    if not PORTABLE:
+        try:
+            write_units(cfg)
+            sc("restart", "msub-refresh.timer")
+        except Exception:
+            pass
+    return {"ok": True, "restart": restart}
 
 
 def web_new_token():
@@ -1782,16 +1829,16 @@ def ensure_web_cert(ip):
     return True
 
 
-def make_admin_server(web):
+def make_admin_server(web, bind=""):
     port = int(web["port"])
     if web.get("https") and os.path.exists(WEB_CERT) and os.path.exists(WEB_KEY):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(WEB_CERT, WEB_KEY)
-        srv = TLSServer(("", port), AdminHandler)
+        srv = TLSServer((bind, port), AdminHandler)
         srv.ctx = ctx
         return srv
-    return Server(("", port), AdminHandler)
+    return Server((bind, port), AdminHandler)
 
 
 def web_url(cfg):
@@ -1981,6 +2028,12 @@ details summary{cursor:pointer;margin:8px 0}
     </section>
     <section id="tab-settings" hidden>
       <div class="card" id="infoCard"></div>
+      <div class="card" id="lanCard" hidden>
+        <h3>局域网访问</h3>
+        <label><input type="checkbox" id="lanChk"> 允许同一 Wi-Fi / 局域网里的手机访问订阅和管理页面</label>
+        <p class="muted small">默认只有本机能访问。开启后需要重启本程序才生效；局域网内网页管理使用 HTTP，请只在可信的家庭网络里开启。</p>
+        <div class="row"><button id="saveLan">保存</button></div>
+      </div>
       <div class="card">
         <h3>自动刷新</h3>
         <div class="row"><span>每</span><input id="interval" type="number" min="1" max="168"><span>小时刷新一次</span><button id="saveInterval">保存</button></div>
@@ -2261,6 +2314,8 @@ details summary{cursor:pointer;margin:8px 0}
       box.appendChild(el("div", { "class": "row spread" }, [el("span", { "class": "muted", text: p[0] }), el("span", { text: p[1] })]));
     });
     $("interval").value = state.interval;
+    $("lanCard").hidden = !state.portable;
+    $("lanChk").checked = !!state.lan;
   }
 
   function renderAll() {
@@ -2294,6 +2349,12 @@ details summary{cursor:pointer;margin:8px 0}
     $("qrClose").addEventListener("click", function () { $("qrBox").hidden = true; });
     $("saveInterval").addEventListener("click", function () {
       api("POST", "settings", { interval: parseInt($("interval").value, 10) }).then(function () { toast("已保存"); return loadState(); }).catch(fail);
+    });
+    $("saveLan").addEventListener("click", function () {
+      api("POST", "settings", { lan: $("lanChk").checked }).then(function (j) {
+        toast(j.restart ? "已保存，重启本程序后生效" : "已保存");
+        return loadState();
+      }).catch(fail);
     });
     $("refreshBtn").addEventListener("click", function () {
       toast("正在刷新…");
@@ -2335,11 +2396,11 @@ def do_serve():
     web = cfg.get("web") or {}
     if web.get("enabled") and web.get("hash"):
         try:
-            adm = make_admin_server(web)
+            adm = make_admin_server(web, cfg.get("bind", ""))
             threading.Thread(target=adm.serve_forever, daemon=True).start()
         except Exception as e:
             print("网页管理启动失败: %s" % e, flush=True)
-    Server(("", int(cfg["port"])), Handler).serve_forever()
+    Server((cfg.get("bind", ""), int(cfg["port"])), Handler).serve_forever()
 
 
 # ============================================================
@@ -2347,6 +2408,8 @@ def do_serve():
 # ============================================================
 
 def write_units(cfg):
+    if PORTABLE:
+        return
     py = sys.executable or "/usr/bin/python3"
     write_atomic(WEB_UNIT, """[Unit]
 Description=msub subscription web service
@@ -2382,6 +2445,8 @@ WantedBy=timers.target
 
 
 def install_self():
+    if PORTABLE:
+        return
     me = os.path.realpath(sys.argv[0])
     if me != os.path.realpath(BIN_PATH) and os.path.isfile(me):
         try:
@@ -2434,6 +2499,8 @@ def ensure_cfg():
     cfg = load_cfg()
     if cfg.get("token") and cfg.get("port"):
         return cfg
+    if PORTABLE:
+        return portable_setup()
     return setup()
 
 
@@ -2485,7 +2552,8 @@ def show_urls(cfg, qr=False, only=None):
                 print("   （未能安装 qrencode，无法显示二维码）")
         print("")
     print("⚠️  订阅链接含全部节点密码，请勿公开分享。")
-    print("⚠️  请确认云安全组已放行 TCP %s。" % cfg.get("port"))
+    if not PORTABLE:
+        print("⚠️  请确认云安全组已放行 TCP %s。" % cfg.get("port"))
     print(LINE)
 
 
@@ -3120,7 +3188,7 @@ def settings():
 
 def http_code(url):
     try:
-        with urllib.request.urlopen(url, timeout=5) as r:
+        with LOCAL_OPENER.open(url, timeout=5) as r:
             return r.status
     except urllib.error.HTTPError as e:
         return e.code
@@ -3193,7 +3261,9 @@ def upgrade(assume_yes=False, check_only=False):
             print(l)
     else:
         print("✅ 已经是最新版本。")
-    if check_only:
+    if PORTABLE and newer:
+        print("绿色版请到 GitHub 仓库的 Releases 页面下载新版本，解压后覆盖程序文件（保留 data 文件夹即可保留你的数据）。")
+    if check_only or PORTABLE:
         return
     if not assume_yes:
         ans = input("确定升级吗？(Y/n): " if newer else "仍要强制重新安装吗？(y/N): ").strip().lower()
@@ -3210,6 +3280,8 @@ def upgrade(assume_yes=False, check_only=False):
 
 
 def post_upgrade():
+    if PORTABLE:
+        return
     cfg = load_cfg()
     if cfg:
         write_units(cfg)
@@ -3220,6 +3292,9 @@ def post_upgrade():
 
 
 def uninstall():
+    if PORTABLE:
+        print("绿色版无需卸载：关闭程序后，直接删除整个文件夹即可。")
+        return
     print(LINE)
     print("⚠️  将删除订阅服务、所有节点组与生成的订阅文件（不影响其他 VPS 和你的节点）。")
     if input("确定要卸载吗？(y/N): ").strip().lower() not in ("y", "yes"):
@@ -3308,6 +3383,226 @@ def menu():
         print("")
 
 
+# ============================================================
+#  便携模式（Windows 绿色版）：双击运行，数据保存在程序旁的 data 文件夹
+# ============================================================
+
+def fix_console():
+    """让 Windows 控制台能正常显示中文"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def get_lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))          # UDP 不会真的发包，只是让系统选出本机出口地址
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def pick_free_port(start, avoid=()):
+    for p in range(start, start + 200):
+        if p not in avoid and port_free(p):
+            return p
+    return start
+
+
+def portable_setup(interactive=True, password=None):
+    for d in (BASE, CACHE_DIR, OUT_DIR):
+        os.makedirs(d, exist_ok=True)
+    cfg = load_cfg()
+    if not cfg.get("token"):
+        cfg["token"] = os.urandom(8).hex()
+    cfg.setdefault("interval_hours", 3)
+    cfg.setdefault("lan", False)
+    if not cfg.get("port"):
+        cfg["port"] = pick_free_port(DEFAULT_PORT)
+    web = dict(cfg.get("web") or {})
+    if not web.get("port"):
+        web["port"] = pick_free_port(DEFAULT_WEB_PORT, avoid=(cfg["port"],))
+    web["https"] = False
+    web["enabled"] = True
+    if not web.get("hash"):
+        pw = password
+        if pw is None:
+            if not interactive:
+                raise RuntimeError("需要先设置网页登录密码")
+            print(LINE)
+            print("  首次运行：请设置网页管理的登录密码")
+            print(LINE)
+            for _ in range(5):
+                a = ask_secret("设置登录密码（至少 8 位，输入时不显示）: ")
+                if len(a) < 8:
+                    print("❌ 密码至少 8 位。")
+                    continue
+                if ask_secret("再输入一次: ") != a:
+                    print("❌ 两次输入不一致。")
+                    continue
+                pw = a
+                break
+            if pw is None:
+                die("❌ 没有设置密码，已退出。")
+        web.update(hash_password(pw))
+    cfg["web"] = web
+    cfg["bind"] = "0.0.0.0" if cfg["lan"] else "127.0.0.1"
+    cfg["ip"] = get_lan_ip() if cfg["lan"] else "127.0.0.1"
+    save_cfg(cfg)
+    return cfg
+
+
+def portable_refresher():
+    last = time.time()
+    try:
+        with WEB_LOCK:
+            do_refresh(verbose=False)
+    except Exception:
+        pass
+    while True:
+        time.sleep(30)
+        try:
+            interval = max(1, int(load_cfg().get("interval_hours", 3))) * 3600
+            if time.time() - last >= interval:
+                last = time.time()
+                with WEB_LOCK:
+                    do_refresh(verbose=False)
+        except Exception:
+            pass
+
+
+def start_portable_servers(cfg):
+    """启动订阅服务和网页管理；端口被占用时抛出 OSError"""
+    adm = make_admin_server(cfg["web"], cfg["bind"])
+    try:
+        sub = Server((cfg["bind"], int(cfg["port"])), Handler)
+    except OSError:
+        adm.server_close()
+        raise
+    for srv in (adm, sub):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return sub, adm
+
+
+def run_portable():
+    fix_console()
+    cfg = portable_setup()
+    admin_url = "http://127.0.0.1:%s/admin" % cfg["web"]["port"]
+    try:
+        start_portable_servers(cfg)
+    except OSError:
+        print("端口已被占用，msub 可能已经在运行。正在为你打开管理页面：%s" % admin_url)
+        webbrowser.open(admin_url)
+        time.sleep(1.5)
+        return
+    threading.Thread(target=portable_refresher, daemon=True).start()
+    print(LINE)
+    print("  msub 订阅合并工具 v%s（绿色版）" % VERSION)
+    print(LINE)
+    print("  数据文件夹: %s" % BASE)
+    print("  网页管理:   %s" % admin_url)
+    print("  订阅地址:   http://%s:%s/%s/sub" % (cfg["ip"], cfg["port"], cfg["token"]))
+    if cfg.get("lan"):
+        print("  局域网访问: 已开启（手机连同一 Wi-Fi，用 %s 代替 127.0.0.1）" % cfg["ip"])
+    print(LINE)
+    print("  程序运行期间订阅链接才可访问；关闭本窗口即停止。")
+    print("  命令: o=打开管理页面   l=显示订阅链接   r=立即刷新   q=退出")
+    print(LINE)
+    webbrowser.open(admin_url)
+    while True:
+        try:
+            c = input("> ").strip().lower()
+        except EOFError:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            break
+        if c in ("q", "quit", "exit"):
+            break
+        elif c in ("", "o"):
+            webbrowser.open(admin_url)
+        elif c == "l":
+            show_urls(load_cfg(), qr=False)
+        elif c == "r":
+            with WEB_LOCK:
+                do_refresh()
+        else:
+            print("命令: o=打开管理页面   l=显示订阅链接   r=立即刷新   q=退出")
+    print("已退出。")
+
+
+def selftest():
+    """打包后的自检：启动服务、登录、添加节点、读取各种订阅。用于 CI 确认 exe 能正常工作。"""
+    fix_console()
+    results = []
+
+    def check(name, cond):
+        results.append(bool(cond))
+        print(("OK   " if cond else "FAIL ") + name)
+        sys.stdout.flush()
+
+    try:
+        import http.cookiejar
+        cfg = portable_setup(interactive=False, password="selftest-password-1")
+        start_portable_servers(cfg)
+        base = "http://127.0.0.1:%s" % cfg["web"]["port"]
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+        def call(method, path, body=None, csrf=""):
+            data = json.dumps(body).encode("utf-8") if body is not None else None
+            req = urllib.request.Request(base + path, data=data, method=method)
+            if body is not None:
+                req.add_header("Content-Type", "application/json")
+                req.add_header("X-CSRF-Token", csrf)
+            with op.open(req, timeout=20) as r:
+                return r.status, r.read()
+
+        st, page = call("GET", "/admin")
+        check("网页管理页面可以打开", st == 200 and b"msub" in page)
+        st, b = call("POST", "/admin/api/login", {"password": "selftest-password-1"})
+        j = json.loads(b.decode("utf-8"))
+        check("登录成功", st == 200 and j.get("ok"))
+        csrf = j.get("csrf", "")
+        link = "ss://" + b64u("aes-256-gcm:selftestpass") + "@203.0.113.9:8388#selftest-node"
+        st, b = call("POST", "/admin/api/add/commit", {"items": [{"kind": "links", "value": [link], "name": "自检"}]}, csrf)
+        check("添加节点并合并", st == 200 and json.loads(b.decode("utf-8")).get("nodes") == 1)
+        st, b = call("GET", "/admin/api/state")
+        stt = json.loads(b.decode("utf-8"))
+        check("读取状态", stt.get("nodes") == 1 and stt.get("ready"))
+        kinds = [("通用订阅", "ss://"), ("sing-box 全局", '"outbounds"'), ("sing-box 分流", "rule_set"), ("Clash", "proxies:")]
+        for i, (label, needle) in enumerate(kinds):
+            with op.open(stt["links"][i]["url"], timeout=20) as r:
+                body = r.read().decode("utf-8")
+            if i == 0:
+                body = b64d(body).decode("utf-8")
+            check("%s 订阅可访问" % label, needle in body)
+        svg = qr_svg("selftest")
+        if getattr(sys, "frozen", False):
+            check("二维码生成可用", svg is not None and "<svg" in svg)
+        else:
+            print("SKIP 二维码（非打包环境）")
+        check("TLS 证书库可用", ssl.create_default_context() is not None)
+    except Exception as e:
+        check("自检过程出现异常: %r" % (e,), False)
+    good = bool(results) and all(results)
+    print("SELFTEST OK" if good else "SELFTEST FAILED")
+    sys.stdout.flush()
+    sys.exit(0 if good else 1)
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     rest = argv[2:]
@@ -3316,6 +3611,12 @@ def main(argv):
         return
     if cmd == "serve":
         do_serve()
+        return
+    if cmd == "selftest":
+        selftest()
+        return
+    if cmd == "" and PORTABLE:
+        run_portable()
         return
     if cmd in ("", "menu"):
         need_root()
