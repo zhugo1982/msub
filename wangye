@@ -1,0 +1,3377 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+msub - 订阅合并工具
+把多台 VPS 的节点 / 订阅合并成一组订阅链接（通用订阅、sing-box、Clash）并生成二维码。
+
+来源有两种:
+  1. 其他 VPS 的订阅地址（推荐，来源更新后自动同步；Hugo 脚本的地址能完整带上 ShadowTLS）
+  2. 直接粘贴的节点链接（vless / vmess / trojan / ss / hysteria2 / tuic / anytls / socks）
+
+只依赖 python3；二维码需要 qrencode（会自动安装）。
+"""
+import base64
+import copy
+import getpass
+import hashlib
+import hmac
+import ipaddress
+import http.cookies
+import http.server
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.4.0"
+# 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
+# CHANGELOG-BEGIN
+# 1.4.0  新增网页管理界面（手机/电脑浏览器管理节点、查看订阅链接和二维码），默认关闭，需设置密码，独立端口，默认 HTTPS；主菜单新增「网页管理界面」（原 6-10 项顺延）
+# 1.3.2  添加节点时可输入 0 返回主菜单或放弃当前项；分流服务支持编辑（追加/删除域名和 IP 段）
+# 1.3.1  菜单与提示里把「来源」统一称为「节点组」（一个节点组对应客户端里的一个分组）
+# 1.3.0  添加订阅地址/节点链接时可并入已有来源（输入编号或已有名称）；一个来源可同时包含多个订阅地址和粘贴的节点；自动兼容旧版数据
+# 1.2.1  修复：部分 sing-box 订阅里的节点缺少 server 等字段导致合并时报错；现在会自动补全或跳过异常节点并提示原因
+# 1.2.0  添加完成后可返回主菜单；新增来源与节点管理（改来源名、改节点名）；sing-box 大陆直连分流订阅新增 Telegram/YouTube/Muse/Claude/X/Facebook/Gemini/Instagram 指定分流，可自定义服务
+# 1.1.0  添加来源合并为一个入口（订阅地址和节点链接可混贴、可多次粘贴）；合并后只输出链接，二维码单独选项查看；合并后可选继续添加或退出
+# 1.0.0  首个版本：合并多台 VPS 的订阅/节点，输出通用订阅、sing-box、Clash，并生成二维码
+# CHANGELOG-END
+
+# 脚本升级地址（改成你自己 GitHub 仓库里这个文件的原始地址）
+SCRIPT_URL = "https://raw.githubusercontent.com/zhugo1982/msub/refs/heads/main/msub"
+
+BIN_PATH = "/usr/local/bin/msub"
+BASE = "/etc/hugo-merge"
+CFG_FILE = BASE + "/config.json"
+SRC_FILE = BASE + "/sources.json"
+REPORT_FILE = BASE + "/report.json"
+CACHE_DIR = BASE + "/cache"
+OUT_DIR = BASE + "/out"
+DEFAULT_PORT = 2095
+LINE = "=" * 60
+
+WEB_UNIT = "/etc/systemd/system/msub-web.service"
+REFRESH_UNIT = "/etc/systemd/system/msub-refresh.service"
+TIMER_UNIT = "/etc/systemd/system/msub-refresh.timer"
+
+SERV_FILE = BASE + "/services.json"
+RESERVED_TAGS = {"proxy", "auto", "direct", "节点选择", "自动选择", "DIRECT"}
+
+# 指定分流服务（用于 sing-box「大陆直连分流」订阅）。每个服务会生成一个可单独选节点的分组。
+# 域名未覆盖到的流量不会出错，只是走默认的 proxy 分组。可在 msub 设置里增删自定义服务。
+DEFAULT_SERVICES = [
+    {"tag": "Telegram",
+     "domains": ["telegram.org", "telegram.me", "t.me", "telegra.ph", "telesco.pe", "tdesktop.com",
+                 "telegram-cdn.org", "cdn-telegram.org", "tg.dev", "graph.org"],
+     "cidrs": ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
+               "91.108.56.0/22", "149.154.160.0/20", "2001:67c:4e8::/48", "2001:b28:f23d::/48",
+               "2001:b28:f23f::/48", "2a0a:f280::/32"]},
+    {"tag": "YouTube",
+     "domains": ["youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com", "ytimg.com",
+                 "ggpht.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be"], "cidrs": []},
+    {"tag": "Muse",
+     "domains": ["muse.ai"], "cidrs": []},
+    {"tag": "Claude",
+     "domains": ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"], "cidrs": []},
+    {"tag": "X",
+     "domains": ["x.com", "twitter.com", "t.co", "twimg.com", "twittercdn.com", "pscp.tv", "periscope.tv"],
+     "cidrs": []},
+    {"tag": "Facebook",
+     "domains": ["facebook.com", "fb.com", "fb.me", "fbcdn.net", "facebook.net", "fbsbx.com",
+                 "messenger.com", "m.me", "fburl.com"], "cidrs": []},
+    {"tag": "Gemini",
+     "domains": ["gemini.google.com", "gemini.google", "bard.google.com", "aistudio.google.com", "ai.google.dev",
+                 "makersuite.google.com", "generativelanguage.googleapis.com", "notebooklm.google.com",
+                 "notebooklm.google", "labs.google", "deepmind.google", "deepmind.com",
+                 "aisandbox-pa.googleapis.com"], "cidrs": []},
+    {"tag": "Instagram",
+     "domains": ["instagram.com", "cdninstagram.com", "instagr.am", "ig.me"], "cidrs": []},
+]
+
+SUPPORTED = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "anytls", "socks"}
+
+
+# ============================================================
+#  通用工具
+# ============================================================
+
+def die(msg, code=1):
+    print(msg)
+    sys.exit(code)
+
+
+def need_root():
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        die("❌ 请使用 root 权限运行（例如: sudo msub）")
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_atomic(path, data, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def write_json(path, obj, mode=0o600):
+    write_atomic(path, json.dumps(obj, ensure_ascii=False, indent=2), mode)
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, **kw)
+    except FileNotFoundError:
+        return None
+
+
+def sc(*args):
+    """systemctl 封装，没有 systemctl 时静默返回 None"""
+    if not shutil.which("systemctl"):
+        return None
+    return run(["systemctl"] + list(args))
+
+
+def b64d(s):
+    s = s.strip().replace("\n", "").replace("\r", "")
+    s = s.replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def b64e(b):
+    return base64.b64encode(b).decode()
+
+
+def b64u(s):
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode().rstrip("=")
+
+
+def quote(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def ver_tuple(v):
+    out = []
+    for p in re.split(r"[.\-]", v):
+        out.append(int(p) if p.isdigit() else 0)
+    return tuple(out)
+
+
+def get_public_ip():
+    for u in ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://ifconfig.me"):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "msub"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                ip = r.read().decode().strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                return ip
+        except Exception:
+            continue
+    return ""
+
+
+def port_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def open_firewall(port):
+    if shutil.which("ufw"):
+        r = run(["ufw", "status"])
+        if r and "Status: active" in r.stdout:
+            run(["ufw", "allow", "%d/tcp" % port])
+            return
+    if shutil.which("firewall-cmd"):
+        r = sc("is-active", "firewalld")
+        if r and r.stdout.strip() == "active":
+            run(["firewall-cmd", "--permanent", "--add-port=%d/tcp" % port])
+            run(["firewall-cmd", "--reload"])
+
+
+def close_firewall(port):
+    if shutil.which("ufw"):
+        r = run(["ufw", "status"])
+        if r and "Status: active" in r.stdout:
+            run(["ufw", "delete", "allow", "%d/tcp" % port])
+            return
+    if shutil.which("firewall-cmd"):
+        r = sc("is-active", "firewalld")
+        if r and r.stdout.strip() == "active":
+            run(["firewall-cmd", "--permanent", "--remove-port=%d/tcp" % port])
+            run(["firewall-cmd", "--reload"])
+
+
+# ============================================================
+#  配置 / 来源存取
+# ============================================================
+
+def load_cfg():
+    return read_json(CFG_FILE, {})
+
+
+def save_cfg(cfg):
+    write_json(CFG_FILE, cfg)
+
+
+def load_services():
+    d = read_json(SERV_FILE, None)
+    if isinstance(d, dict) and isinstance(d.get("services"), list):
+        return d["services"]
+    return copy.deepcopy(DEFAULT_SERVICES)
+
+
+def save_services(sv):
+    write_json(SERV_FILE, {"services": sv})
+
+
+DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$")
+
+
+def parse_domains(text):
+    """把用户输入拆成域名后缀列表，返回 (有效列表, 无效列表)"""
+    good, bad = [], []
+    for d in re.split(r"[,\s;，]+", text.strip().lower()):
+        d = d.strip().lstrip("*.").lstrip(".")
+        if not d:
+            continue
+        if DOMAIN_RE.match(d) and "." in d:
+            if d not in good:
+                good.append(d)
+        else:
+            bad.append(d)
+    return good, bad
+
+
+def parse_cidrs(text):
+    """解析 IP 段（支持单个 IP），返回 (有效列表, 无效列表)"""
+    good, bad = [], []
+    for t in re.split(r"[,\s;，]+", text.strip()):
+        if not t:
+            continue
+        try:
+            net = str(ipaddress.ip_network(t, strict=False))
+            if net not in good:
+                good.append(net)
+        except ValueError:
+            bad.append(t)
+    return good, bad
+
+
+def normalize_source(s):
+    """统一来源结构 {id, name, urls[], links[], renames{}}，兼容旧版的 type/url 写法"""
+    if "urls" not in s:
+        s["urls"] = [s["url"]] if s.get("type") == "url" and s.get("url") else []
+    s.setdefault("links", [])
+    s.setdefault("name", "")
+    s.setdefault("renames", {})
+    s.pop("type", None)
+    s.pop("url", None)
+    return s
+
+
+def load_sources():
+    return [normalize_source(x) for x in read_json(SRC_FILE, []) if isinstance(x, dict)]
+
+
+def save_sources(src):
+    write_json(SRC_FILE, src)
+
+
+def base_url(cfg):
+    return "http://%s:%s/%s" % (cfg.get("ip", "你的IP"), cfg.get("port"), cfg.get("token"))
+
+
+# ============================================================
+#  节点链接解析  ->  sing-box 出站字典
+# ============================================================
+
+def _split(line):
+    u = urllib.parse.urlsplit(line)
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    name = urllib.parse.unquote(u.fragment)
+    return u, qs, name
+
+
+def _q(qs, k, d=""):
+    v = qs.get(k)
+    return v[0] if v else d
+
+
+def _truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def _tls_from_qs(qs, default_enabled=True):
+    tls = {"enabled": default_enabled}
+    sni = _q(qs, "sni") or _q(qs, "peer") or _q(qs, "servername")
+    if sni:
+        tls["server_name"] = sni
+    fp = _q(qs, "fp")
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    if (_truthy(_q(qs, "allowInsecure")) or _truthy(_q(qs, "insecure"))
+            or _truthy(_q(qs, "allow_insecure")) or _truthy(_q(qs, "skip-cert-verify"))):
+        tls["insecure"] = True
+    alpn = _q(qs, "alpn")
+    if alpn:
+        tls["alpn"] = [a for a in alpn.split(",") if a]
+    return tls
+
+
+def _transport_from_qs(qs):
+    t = _q(qs, "type", "tcp").lower()
+    if t == "grpc":
+        return {"type": "grpc", "service_name": _q(qs, "serviceName")}
+    if t == "ws":
+        tr = {"type": "ws", "path": _q(qs, "path", "/") or "/"}
+        host = _q(qs, "host")
+        if host:
+            tr["headers"] = {"Host": host}
+        return tr
+    return None
+
+
+def _hostport(u, default_port):
+    if not u.hostname:
+        raise ValueError("链接里没有服务器地址")
+    try:
+        port = u.port or default_port
+    except ValueError:
+        raise ValueError("端口格式不正确")
+    return u.hostname, int(port)
+
+
+def p_vless(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("vless 链接缺少 UUID")
+    out = {"type": "vless", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "uuid": urllib.parse.unquote(u.username)}
+    flow = _q(qs, "flow")
+    if flow:
+        out["flow"] = flow
+    sec = _q(qs, "security", "none").lower()
+    if sec in ("tls", "reality"):
+        tls = _tls_from_qs(qs)
+        if sec == "reality":
+            tls["reality"] = {"enabled": True, "public_key": _q(qs, "pbk"), "short_id": _q(qs, "sid")}
+            if "utls" not in tls:
+                tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+        out["tls"] = tls
+    tr = _transport_from_qs(qs)
+    if tr:
+        out["transport"] = tr
+    return out
+
+
+def p_vmess(line):
+    raw = line.split("://", 1)[1].split("#", 1)[0]
+    try:
+        j = json.loads(b64d(raw).decode("utf-8", "ignore"))
+    except Exception:
+        raise ValueError("vmess 链接无法解析")
+    if not j.get("add") or not j.get("id"):
+        raise ValueError("vmess 链接缺少地址或 UUID")
+    out = {"type": "vmess", "tag": j.get("ps") or "%s:%s" % (j["add"], j.get("port")),
+           "server": j["add"], "server_port": int(j.get("port") or 443), "uuid": j["id"],
+           "security": j.get("scy") or "auto", "alter_id": int(j.get("aid") or 0)}
+    if str(j.get("tls", "")).lower() in ("tls", "1", "true"):
+        tls = {"enabled": True}
+        sni = j.get("sni") or j.get("host")
+        if sni:
+            tls["server_name"] = sni
+        if j.get("alpn"):
+            tls["alpn"] = [a for a in str(j["alpn"]).split(",") if a]
+        out["tls"] = tls
+    net = (j.get("net") or "tcp").lower()
+    if net == "ws":
+        tr = {"type": "ws", "path": j.get("path") or "/"}
+        if j.get("host"):
+            tr["headers"] = {"Host": j["host"]}
+        out["transport"] = tr
+    elif net == "grpc":
+        out["transport"] = {"type": "grpc", "service_name": j.get("path") or ""}
+    return out
+
+
+def p_trojan(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("trojan 链接缺少密码")
+    out = {"type": "trojan", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "password": urllib.parse.unquote(u.username),
+           "tls": _tls_from_qs(qs)}
+    tr = _transport_from_qs(qs)
+    if tr:
+        out["transport"] = tr
+    return out
+
+
+def p_ss(line):
+    body = line.split("://", 1)[1]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = urllib.parse.unquote(frag)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+    if "plugin=" in query:
+        raise ValueError("带插件的 ss 链接暂不支持（ShadowTLS 请添加那台 VPS 的订阅地址）")
+    body = body.rstrip("/")
+    try:
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            ui = urllib.parse.unquote(userinfo)
+            if ":" not in ui:
+                ui = b64d(userinfo).decode("utf-8")
+            method, password = ui.split(":", 1)
+        else:
+            dec = b64d(body).decode("utf-8")
+            userinfo, hostport = dec.rsplit("@", 1)
+            method, password = userinfo.split(":", 1)
+        host, port = hostport.rsplit(":", 1)
+        host = host.strip("[]")
+        port = int(port)
+    except Exception:
+        raise ValueError("ss 链接无法解析")
+    return {"type": "shadowsocks", "tag": name or "%s:%s" % (host, port), "server": host,
+            "server_port": port, "method": method, "password": password}
+
+
+def p_hy2(line):
+    if line.lower().startswith("hy2://"):
+        line = "hysteria2://" + line[6:]
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    pw = urllib.parse.unquote(u.username or "")
+    if u.password is not None:
+        pw = pw + ":" + urllib.parse.unquote(u.password)
+    if not pw:
+        raise ValueError("hysteria2 链接缺少密码")
+    out = {"type": "hysteria2", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "password": pw, "tls": _tls_from_qs(qs)}
+    if _q(qs, "obfs"):
+        out["obfs"] = {"type": _q(qs, "obfs"), "password": _q(qs, "obfs-password")}
+    return out
+
+
+def p_tuic(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username or u.password is None:
+        raise ValueError("tuic 链接缺少 UUID 或密码")
+    tls = _tls_from_qs(qs)
+    if "alpn" not in tls:
+        tls["alpn"] = ["h3"]
+    out = {"type": "tuic", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port, "uuid": urllib.parse.unquote(u.username),
+           "password": urllib.parse.unquote(u.password),
+           "congestion_control": _q(qs, "congestion_control", "bbr"), "tls": tls}
+    mode = _q(qs, "udp_relay_mode")
+    if mode:
+        out["udp_relay_mode"] = mode
+    return out
+
+
+def p_anytls(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 443)
+    if not u.username:
+        raise ValueError("anytls 链接缺少密码")
+    return {"type": "anytls", "tag": name or "%s:%s" % (host, port), "server": host,
+            "server_port": port, "password": urllib.parse.unquote(u.username),
+            "tls": _tls_from_qs(qs)}
+
+
+def p_socks(line):
+    u, qs, name = _split(line)
+    host, port = _hostport(u, 1080)
+    user = pw = ""
+    if u.password is not None:
+        user = urllib.parse.unquote(u.username or "")
+        pw = urllib.parse.unquote(u.password)
+    elif u.username:
+        try:
+            dec = b64d(u.username).decode("utf-8")
+            if ":" in dec:
+                user, pw = dec.split(":", 1)
+            else:
+                user = urllib.parse.unquote(u.username)
+        except Exception:
+            user = urllib.parse.unquote(u.username)
+    out = {"type": "socks", "tag": name or "%s:%s" % (host, port), "server": host,
+           "server_port": port}
+    if user:
+        out["username"] = user
+        out["password"] = pw
+    return out
+
+
+PARSERS = {
+    "vless": p_vless, "vmess": p_vmess, "trojan": p_trojan, "ss": p_ss,
+    "hysteria2": p_hy2, "hy2": p_hy2, "tuic": p_tuic, "anytls": p_anytls,
+    "socks": p_socks, "socks5": p_socks,
+}
+
+
+def parse_link(line):
+    line = line.strip()
+    if "://" not in line:
+        raise ValueError("不是节点链接")
+    scheme = line.split("://", 1)[0].lower()
+    fn = PARSERS.get(scheme)
+    if not fn:
+        raise ValueError("暂不支持的协议: %s" % scheme)
+    return fn(line)
+
+
+# ============================================================
+#  节点结构:  {"out": sing-box 出站, "helpers": [辅助出站, 如 shadowtls]}
+# ============================================================
+
+REQUIRED_FIELDS = {
+    "vless": ["uuid"], "vmess": ["uuid"], "trojan": ["password"],
+    "shadowsocks": ["method", "password"], "hysteria2": ["password"],
+    "tuic": ["uuid"], "anytls": ["password"], "socks": [],
+}
+
+
+def node_problem(n):
+    """返回节点存在的问题描述；没问题返回空字符串"""
+    o = n.get("out") or {}
+    if o.get("type") not in REQUIRED_FIELDS:
+        return "不支持的类型"
+    if not o.get("server"):
+        return "缺少服务器地址"
+    try:
+        port = int(o.get("server_port"))
+    except (TypeError, ValueError):
+        return "缺少或错误的端口"
+    if not (1 <= port <= 65535):
+        return "端口超出范围"
+    for f in REQUIRED_FIELDS[o["type"]]:
+        if not o.get(f):
+            return "缺少字段 %s" % f
+    return ""
+
+
+def nodes_from_singbox_json(text):
+    j = json.loads(text)
+    obs = j.get("outbounds") or []
+    by_tag = {o.get("tag"): o for o in obs}
+    nodes, skipped = [], []
+    for o in obs:
+        if o.get("type") not in SUPPORTED:
+            continue
+        node = {"out": copy.deepcopy(o), "helpers": []}
+        d = o.get("detour")
+        if d:
+            t = by_tag.get(d)
+            if t and t.get("type") == "shadowtls":
+                node["helpers"].append(copy.deepcopy(t))
+                # 经 ShadowTLS 的节点，服务器地址常写在辅助出站里，这里补齐
+                if not node["out"].get("server"):
+                    node["out"]["server"] = t.get("server", "")
+                if not node["out"].get("server_port"):
+                    node["out"]["server_port"] = t.get("server_port")
+            else:
+                node["out"].pop("detour", None)
+        if not node["out"].get("tag"):
+            node["out"]["tag"] = "%s-%s:%s" % (o.get("type"), node["out"].get("server", "?"),
+                                              node["out"].get("server_port", "?"))
+        why = node_problem(node)
+        if why:
+            skipped.append((str(node["out"].get("tag")), why))
+            continue
+        nodes.append(node)
+    return nodes, skipped
+
+
+def extract_lines(text):
+    t = text.strip()
+    if "://" not in t[:300]:
+        try:
+            dec = b64d(t).decode("utf-8", "ignore")
+            if "://" in dec:
+                t = dec
+        except Exception:
+            pass
+    return [l.strip() for l in t.replace("\r", "").split("\n")
+            if l.strip() and not l.strip().startswith("#")]
+
+
+def parse_lines(lines):
+    nodes, skipped = [], []
+    for ln in lines:
+        try:
+            n = {"out": parse_link(ln), "helpers": []}
+            why = node_problem(n)
+            if why:
+                raise ValueError(why)
+            nodes.append(n)
+        except (ValueError, KeyError, TypeError) as e:
+            skipped.append((ln[:50] + ("…" if len(ln) > 50 else ""), str(e)))
+    return nodes, skipped
+
+
+def parse_content(text):
+    t = text.strip()
+    if t.startswith("{"):
+        try:
+            return nodes_from_singbox_json(t)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return parse_lines(extract_lines(t))
+
+
+HUGO_RE = re.compile(r"^(https?://[^/]+/[0-9a-f]{16})/(sub|singbox|singbox-cn|clash)/?$")
+
+
+def candidate_urls(url):
+    m = HUGO_RE.match(url.strip())
+    if m:
+        return [m.group(1) + "/singbox", m.group(1) + "/sub"]
+    return [url.strip()]
+
+
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": "msub/" + VERSION})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(8 * 1024 * 1024)
+    return data.decode("utf-8", "ignore")
+
+
+def fetch_url_nodes(url):
+    """依次尝试候选地址，返回 (节点列表, 实际使用的地址, 跳过列表)"""
+    last_err = None
+    for u in candidate_urls(url):
+        try:
+            text = http_get(u)
+            nodes, skipped = parse_content(text)
+            if nodes:
+                return nodes, u, skipped
+            last_err = "没有解析到可用节点"
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err or "拉取失败")
+
+
+# ============================================================
+#  节点转换: 分享链接 / Clash / sing-box
+# ============================================================
+
+def to_link(node):
+    o = node["out"]
+    if node["helpers"]:
+        return None
+    ty = o["type"]
+    host = o["server"]
+    hp = "[%s]" % host if ":" in host else host
+    port = o["server_port"]
+    tls = o.get("tls") or {}
+    name = quote(o["tag"])
+    tr = o.get("transport") or {}
+    tt = tr.get("type")
+    if tt not in (None, "grpc", "ws"):
+        return None
+
+    def qs_str(pairs):
+        return "&".join("%s=%s" % (k, quote(v)) for k, v in pairs if v not in (None, ""))
+
+    def tr_pairs():
+        if tt == "grpc":
+            return [("type", "grpc"), ("serviceName", tr.get("service_name", "")), ("mode", "gun")]
+        if tt == "ws":
+            return [("type", "ws"), ("path", tr.get("path", "/")), ("host", (tr.get("headers") or {}).get("Host", ""))]
+        return [("type", "tcp")]
+
+    def tls_pairs():
+        pairs = []
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        fp = (tls.get("utls") or {}).get("fingerprint")
+        if fp:
+            pairs.append(("fp", fp))
+        if tls.get("alpn"):
+            pairs.append(("alpn", ",".join(tls["alpn"])))
+        return pairs
+
+    if ty == "vless":
+        pairs = [("encryption", "none")]
+        if o.get("flow"):
+            pairs.append(("flow", o["flow"]))
+        r = tls.get("reality")
+        if r and r.get("enabled"):
+            pairs.append(("security", "reality"))
+            pairs += tls_pairs()
+            pairs += [("pbk", r.get("public_key", "")), ("sid", r.get("short_id", ""))]
+        elif tls.get("enabled"):
+            pairs.append(("security", "tls"))
+            pairs += tls_pairs()
+            if tls.get("insecure"):
+                pairs.append(("allowInsecure", "1"))
+        else:
+            pairs.append(("security", "none"))
+        pairs += tr_pairs()
+        return "vless://%s@%s:%s?%s#%s" % (quote(o["uuid"]), hp, port, qs_str(pairs), name)
+
+    if ty == "vmess":
+        j = {"v": "2", "ps": o["tag"], "add": host, "port": str(port), "id": o["uuid"],
+             "aid": str(o.get("alter_id", 0)), "scy": o.get("security", "auto"),
+             "net": tt or "tcp", "type": "none",
+             "host": (tr.get("headers") or {}).get("Host", ""),
+             "path": tr.get("path", "") if tt == "ws" else tr.get("service_name", "") if tt == "grpc" else "",
+             "tls": "tls" if tls.get("enabled") else "",
+             "sni": tls.get("server_name", "")}
+        return "vmess://" + b64e(json.dumps(j, ensure_ascii=False).encode("utf-8"))
+
+    if ty == "trojan":
+        pairs = [("security", "tls")] + tls_pairs()
+        if tls.get("insecure"):
+            pairs.append(("allowInsecure", "1"))
+        pairs += tr_pairs()
+        return "trojan://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "shadowsocks":
+        return "ss://%s@%s:%s#%s" % (b64u("%s:%s" % (o["method"], o["password"])), hp, port, name)
+
+    if ty == "hysteria2":
+        pairs = []
+        if tls.get("insecure"):
+            pairs.append(("insecure", "1"))
+        pairs += tls_pairs()
+        ob = o.get("obfs")
+        if ob:
+            pairs += [("obfs", ob.get("type", "")), ("obfs-password", ob.get("password", ""))]
+        return "hysteria2://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "tuic":
+        pairs = [("congestion_control", o.get("congestion_control", "bbr"))]
+        if tls.get("alpn"):
+            pairs.append(("alpn", ",".join(tls["alpn"])))
+        if tls.get("insecure"):
+            pairs.append(("allow_insecure", "1"))
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        pairs.append(("udp_relay_mode", o.get("udp_relay_mode", "native")))
+        return "tuic://%s:%s@%s:%s?%s#%s" % (quote(o["uuid"]), quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "anytls":
+        pairs = []
+        if tls.get("insecure"):
+            pairs.append(("insecure", "1"))
+        if tls.get("server_name"):
+            pairs.append(("sni", tls["server_name"]))
+        return "anytls://%s@%s:%s?%s#%s" % (quote(o["password"]), hp, port, qs_str(pairs), name)
+
+    if ty == "socks":
+        if o.get("username"):
+            return "socks://%s@%s:%s#%s" % (b64u("%s:%s" % (o["username"], o.get("password", ""))), hp, port, name)
+        return "socks://%s:%s#%s" % (hp, port, name)
+    return None
+
+
+def to_clash(node):
+    o = node["out"]
+    ty = o["type"]
+    p = {"name": o["tag"], "type": None, "server": o["server"], "port": o["server_port"]}
+    tls = o.get("tls") or {}
+    tr = o.get("transport") or {}
+    tt = tr.get("type")
+
+    def transport():
+        if tt == "grpc":
+            p["network"] = "grpc"
+            p["grpc-opts"] = {"grpc-service-name": tr.get("service_name", "")}
+        elif tt == "ws":
+            p["network"] = "ws"
+            opts = {"path": tr.get("path", "/")}
+            host = (tr.get("headers") or {}).get("Host")
+            if host:
+                opts["headers"] = {"Host": host}
+            p["ws-opts"] = opts
+        elif tt:
+            return False
+        else:
+            p["network"] = "tcp"
+        return True
+
+    def tls_common(sni_key):
+        if tls.get("server_name"):
+            p[sni_key] = tls["server_name"]
+        if tls.get("insecure"):
+            p["skip-cert-verify"] = True
+        if tls.get("alpn"):
+            p["alpn"] = tls["alpn"]
+        fp = (tls.get("utls") or {}).get("fingerprint")
+        if fp:
+            p["client-fingerprint"] = fp
+
+    if ty == "vless":
+        p.update({"type": "vless", "uuid": o["uuid"], "udp": True})
+        if not transport():
+            return None
+        if o.get("flow"):
+            p["flow"] = o["flow"]
+        if tls.get("enabled"):
+            p["tls"] = True
+            tls_common("servername")
+            r = tls.get("reality")
+            if r and r.get("enabled"):
+                p["reality-opts"] = {"public-key": r.get("public_key", ""), "short-id": r.get("short_id", "")}
+        return p
+
+    if ty == "vmess":
+        p.update({"type": "vmess", "uuid": o["uuid"], "alterId": o.get("alter_id", 0),
+                  "cipher": o.get("security", "auto"), "udp": True})
+        if not transport():
+            return None
+        if tls.get("enabled"):
+            p["tls"] = True
+            tls_common("servername")
+        return p
+
+    if ty == "trojan":
+        p.update({"type": "trojan", "password": o["password"], "udp": True})
+        if not transport():
+            return None
+        tls_common("sni")
+        return p
+
+    if ty == "shadowsocks":
+        p.update({"type": "ss", "cipher": o["method"], "password": o["password"], "udp": True})
+        if node["helpers"]:
+            h = node["helpers"][0]
+            p["server"] = h["server"]
+            p["port"] = h["server_port"]
+            p["plugin"] = "shadow-tls"
+            p["client-fingerprint"] = ((h.get("tls") or {}).get("utls") or {}).get("fingerprint", "chrome")
+            p["plugin-opts"] = {"host": (h.get("tls") or {}).get("server_name", ""),
+                                "password": h.get("password", ""), "version": h.get("version", 3)}
+        return p
+
+    if ty == "hysteria2":
+        p.update({"type": "hysteria2", "password": o["password"]})
+        tls_common("sni")
+        ob = o.get("obfs")
+        if ob:
+            p["obfs"] = ob.get("type", "")
+            p["obfs-password"] = ob.get("password", "")
+        return p
+
+    if ty == "tuic":
+        p.update({"type": "tuic", "uuid": o["uuid"], "password": o["password"],
+                  "congestion-controller": o.get("congestion_control", "bbr"),
+                  "udp-relay-mode": o.get("udp_relay_mode", "native")})
+        tls_common("sni")
+        return p
+
+    if ty == "anytls":
+        p.update({"type": "anytls", "password": o["password"], "udp": True})
+        tls_common("sni")
+        return p
+
+    if ty == "socks":
+        p.update({"type": "socks5", "udp": True})
+        if o.get("username"):
+            p["username"] = o["username"]
+            p["password"] = o.get("password", "")
+        return p
+    return None
+
+
+# ---------- 极简 YAML 输出（不依赖 PyYAML）----------
+
+def y_scalar(v):
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(v, ensure_ascii=False)
+
+
+def y_dump(obj, indent=0):
+    sp = "  " * indent
+    lines = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, dict) and v:
+                lines.append("%s%s:" % (sp, k))
+                lines.extend(y_dump(v, indent + 1))
+            elif isinstance(v, list) and v:
+                lines.append("%s%s:" % (sp, k))
+                lines.extend(y_dump(v, indent + 1))
+            elif isinstance(v, dict):
+                lines.append("%s%s: {}" % (sp, k))
+            elif isinstance(v, list):
+                lines.append("%s%s: []" % (sp, k))
+            else:
+                lines.append("%s%s: %s" % (sp, k, y_scalar(v)))
+    elif isinstance(obj, list):
+        for it in obj:
+            if isinstance(it, dict) and it:
+                sub = y_dump(it, indent + 1)
+                lines.append("%s- %s" % (sp, sub[0][len(sp) + 2:]))
+                lines.extend(sub[1:])
+            else:
+                lines.append("%s- %s" % (sp, y_scalar(it)))
+    return lines
+
+
+# ---------- 节点分组辅助 ----------
+
+def safe_convert(fn, node):
+    try:
+        return fn(node)
+    except Exception:
+        return None
+
+
+def is_auto_candidate(node):
+    return node["out"]["type"] != "socks" and not node["helpers"]
+
+
+def source_groups(nodes):
+    """按来源汇总节点，保持出现顺序: {来源名: [node,...]}"""
+    g = {}
+    for n in nodes:
+        g.setdefault(n["source"], []).append(n)
+    return g
+
+
+def build_clash(nodes, cfg):
+    proxies, kept = [], []
+    for n in nodes:
+        c = safe_convert(to_clash, n)
+        if c:
+            proxies.append(c)
+            kept.append(n)
+    names = [p["name"] for p in proxies]
+    cand = [n["out"]["tag"] for n in kept if is_auto_candidate(n)]
+    groups = source_groups(kept)
+    multi = len(groups) > 1
+
+    sel = ["自动选择"] if cand else []
+    pgroups = []
+    if cand:
+        pgroups.append({"name": "自动选择", "type": "url-test", "url": "https://www.gstatic.com/generate_204",
+                        "interval": 300, "tolerance": 50, "proxies": cand})
+    if multi:
+        for src, ns in groups.items():
+            c2 = [n["out"]["tag"] for n in ns if is_auto_candidate(n)]
+            if c2:
+                gname = "自动-%s" % src
+                pgroups.append({"name": gname, "type": "url-test", "url": "https://www.gstatic.com/generate_204",
+                                "interval": 300, "tolerance": 50, "proxies": c2})
+                sel.append(gname)
+    pgroups.insert(0, {"name": "节点选择", "type": "select", "proxies": sel + names + ["DIRECT"]})
+
+    rules = []
+    if cfg.get("ip") and cfg.get("port"):
+        rules.append("AND,((IP-CIDR,%s/32),(DST-PORT,%s)),DIRECT" % (cfg["ip"], cfg["port"]))
+    rules += ["GEOIP,LAN,DIRECT,no-resolve", "GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT", "MATCH,节点选择"]
+
+    doc = {
+        "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "warning", "ipv6": False,
+        "dns": {"enable": True, "ipv6": False, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
+                "nameserver": ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]},
+        "proxies": proxies, "proxy-groups": pgroups, "rules": rules,
+    }
+    return "\n".join(y_dump(doc)) + "\n"
+
+
+def build_singbox(nodes, cfg, cn=False, services=None):
+    outs, tags = [], []
+    for n in nodes:
+        outs.append(copy.deepcopy(n["out"]))
+        outs.extend(copy.deepcopy(h) for h in n["helpers"])
+        tags.append(n["out"]["tag"])
+    cand = [n["out"]["tag"] for n in nodes if is_auto_candidate(n)]
+    groups = source_groups(nodes)
+    multi = len(groups) > 1
+
+    sel = []
+    group_outs = []
+    if cand:
+        group_outs.append({"type": "urltest", "tag": "auto", "outbounds": cand,
+                           "url": "https://www.gstatic.com/generate_204", "interval": "5m"})
+        sel.append("auto")
+    if multi:
+        for src, ns in groups.items():
+            c2 = [n["out"]["tag"] for n in ns if is_auto_candidate(n)]
+            if c2:
+                gt = "auto-%s" % src
+                group_outs.append({"type": "urltest", "tag": gt, "outbounds": c2,
+                                   "url": "https://www.gstatic.com/generate_204", "interval": "5m"})
+                sel.append(gt)
+    selector = {"type": "selector", "tag": "proxy", "outbounds": sel + tags}
+    if sel:
+        selector["default"] = sel[0]
+
+    rules = [{"action": "sniff"}, {"protocol": "dns", "action": "hijack-dns"}]
+    if cfg.get("ip") and cfg.get("port"):
+        rules.append({"ip_cidr": ["%s/32" % cfg["ip"]], "port": [int(cfg["port"])],
+                      "action": "route", "outbound": "direct"})
+    rules.append({"ip_is_private": True, "action": "route", "outbound": "direct"})
+
+    svc_outs = []
+    if cn and services:
+        opts = ["proxy"] + sel + tags
+        for sv in services:
+            svc_outs.append({"type": "selector", "tag": sv["tag"], "outbounds": list(opts), "default": "proxy"})
+            if sv.get("domains"):
+                rules.append({"domain_suffix": list(sv["domains"]), "action": "route", "outbound": sv["tag"]})
+            if sv.get("cidrs"):
+                rules.append({"ip_cidr": list(sv["cidrs"]), "action": "route", "outbound": sv["tag"]})
+
+    doc = {
+        "log": {"level": "warn"},
+        "dns": {"servers": [{"type": "https", "tag": "dns-remote", "server": "1.1.1.1", "detour": "proxy"},
+                            {"type": "udp", "tag": "dns-local", "server": "223.5.5.5"}],
+                "final": "dns-remote"},
+        "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"], "auto_route": True}],
+        "outbounds": [selector] + group_outs + svc_outs + outs + [{"type": "direct", "tag": "direct"}],
+        "route": {"rules": rules, "final": "proxy", "auto_detect_interface": True,
+                  "default_domain_resolver": "dns-local"},
+    }
+    if cn:
+        doc["http_clients"] = [{"tag": "proxy-http", "detour": "proxy"}]
+        doc["route"]["default_http_client"] = "proxy-http"
+        doc["route"]["rule_set"] = [
+            {"tag": "geoip-cn", "type": "remote", "format": "binary",
+             "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"},
+            {"tag": "geosite-cn", "type": "remote", "format": "binary",
+             "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"},
+        ]
+        doc["route"]["rules"].append({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"})
+        doc["dns"]["rules"] = [{"rule_set": "geosite-cn", "action": "route", "server": "dns-local"}]
+    return json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+#  刷新: 拉取所有来源 -> 去重改名 -> 生成输出文件
+# ============================================================
+
+def node_key(n):
+    """去重用的身份标识：只看服务器、端口、凭证等，忽略名字和默认值差异"""
+    o = n["out"]
+    t = o.get("tls") or {}
+    r = t.get("reality") or {}
+    tr = o.get("transport") or {}
+    ident = [o.get("type"), str(o.get("server", "")).lower(), o.get("server_port"), o.get("uuid"), o.get("password"),
+             o.get("username"), o.get("method"), r.get("public_key"), tr.get("type"),
+             tr.get("service_name") or tr.get("path")]
+    hs = [[h.get("server"), h.get("server_port"), h.get("password")] for h in n["helpers"]]
+    return json.dumps([ident, hs], ensure_ascii=False)
+
+
+def uniq(tag, seen):
+    base, i = tag, 2
+    while tag in seen:
+        tag = "%s-%d" % (base, i)
+        i += 1
+    seen.add(tag)
+    return tag
+
+
+def retag(node, prefix, seen, override=None):
+    old = node["out"]["tag"]
+    base = old[5:] if old.startswith("Hugo-") else old
+    if override:
+        tag = uniq(override, seen)
+    else:
+        tag = uniq("%s-%s" % (prefix, base) if prefix else base, seen)
+    node["out"]["tag"] = tag
+    for i, h in enumerate(node["helpers"]):
+        h["tag"] = uniq("%s-helper%d" % (tag, i + 1), seen)
+        node["out"]["detour"] = h["tag"]
+
+
+def source_label(s, idx):
+    return s.get("name") or "S%d" % (idx + 1)
+
+
+def cache_path(s, url):
+    return os.path.join(CACHE_DIR, "%s-%s.json" % (s["id"], hashlib.md5(url.encode("utf-8")).hexdigest()[:8]))
+
+
+def valid_cached_nodes(path):
+    return [n for n in read_json(path, [])
+            if isinstance(n, dict) and isinstance(n.get("out"), dict) and not node_problem(n)]
+
+
+def collect_nodes():
+    sources = load_sources()
+    allnodes, report = [], {}
+    seen_keys = set()
+    seen_tags = set(RESERVED_TAGS) | {sv["tag"] for sv in load_services()}
+    for i, s0 in enumerate(sources):
+        lab = source_label(s0, i)
+        seen_tags.update(["auto-%s" % lab, "自动-%s" % lab])
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for idx, s in enumerate(sources):
+        nodes, notes = [], []
+        for url in s["urls"]:
+            cpath = cache_path(s, url)
+            try:
+                ns, used, skipped = fetch_url_nodes(url)
+                write_json(cpath, ns)
+                nodes.extend(ns)
+            except Exception as e:
+                cached = valid_cached_nodes(cpath)
+                if not cached and len(s["urls"]) == 1:
+                    cached = valid_cached_nodes(os.path.join(CACHE_DIR, s["id"] + ".json"))   # 旧版缓存文件名
+                if cached:
+                    nodes.extend(cached)
+                    notes.append("拉取失败(%s)，使用上次缓存" % e)
+                else:
+                    notes.append("拉取失败: %s" % e)
+        if s["links"]:
+            ns, skipped = parse_lines(s["links"])
+            nodes.extend(ns)
+        status = "ok" if not notes else "；".join(notes)
+        label = source_label(s, idx)
+        kept, keys = [], []
+        renames = s.get("renames", {})
+        for n in nodes:
+            k = node_key(n)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            retag(n, s.get("name", ""), seen_tags, override=renames.get(k))
+            n["source"] = label
+            kept.append(n)
+            keys.append(k)
+        allnodes.extend(kept)
+        report[s["id"]] = {"status": status, "count": len(kept), "tags": [n["out"]["tag"] for n in kept],
+                           "keys": keys, "time": int(time.time())}
+    write_json(REPORT_FILE, report)
+    return allnodes, report
+
+
+def render_outputs(nodes, cfg):
+    links = [l for l in (safe_convert(to_link, n) for n in nodes) if l]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    write_atomic(OUT_DIR + "/sub_b64.txt", b64e("\n".join(links).encode("utf-8")))
+    write_atomic(OUT_DIR + "/clash.yaml", build_clash(nodes, cfg))
+    write_atomic(OUT_DIR + "/singbox.json", build_singbox(nodes, cfg, cn=False))
+    write_atomic(OUT_DIR + "/singbox-cn.json", build_singbox(nodes, cfg, cn=True, services=load_services()))
+    return len(links)
+
+
+def do_refresh(verbose=True):
+    cfg = load_cfg()
+    if not cfg:
+        die("❌ 尚未初始化，请先运行 msub 完成设置。")
+    nodes, report = collect_nodes()
+    if verbose:
+        sources = load_sources()
+        for idx, s in enumerate(sources):
+            r = report.get(s["id"], {})
+            print("  [%s] %s: %s，节点 %d 个" % (idx + 1, source_label(s, idx), r.get("status"), r.get("count", 0)))
+    if not nodes:
+        if not load_sources():
+            for fn in ("sub_b64.txt", "clash.yaml", "singbox.json", "singbox-cn.json"):
+                try:
+                    os.unlink(os.path.join(OUT_DIR, fn))
+                except Exception:
+                    pass
+        if verbose:
+            print("⚠️  当前没有任何可用节点，未更新订阅文件。")
+        return 0
+    n_links = render_outputs(nodes, cfg)
+    if verbose:
+        print("✅ 已合并 %d 个节点（其中 %d 个可用于通用订阅；ShadowTLS 等仅 sing-box / Clash 支持）" % (len(nodes), n_links))
+    return len(nodes)
+
+
+# ============================================================
+#  订阅 Web 服务
+# ============================================================
+
+ROUTES = {
+    "sub": ("sub_b64.txt", "text/plain; charset=utf-8"),
+    "clash": ("clash.yaml", "text/yaml; charset=utf-8"),
+    "singbox": ("singbox.json", "application/json; charset=utf-8"),
+    "singbox-cn": ("singbox-cn.json", "application/json; charset=utf-8"),
+}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        cfg = load_cfg()
+        token = cfg.get("token", "")
+        parts = self.path.split("?")[0].strip("/").split("/")
+        item = None
+        if token and len(parts) == 2 and parts[0] == token:
+            item = ROUTES.get(parts[1])
+        if not item:
+            self.send_error(404, "Not Found")
+            return
+        try:
+            with open(os.path.join(OUT_DIR, item[0]), "rb") as f:
+                data = f.read()
+        except Exception:
+            self.send_error(404, "Not Found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", item[1])
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+# ============================================================
+#  网页管理界面（可选，默认关闭；独立端口，建议 HTTPS）
+# ============================================================
+
+WEB_LOCK = threading.Lock()
+SESS_LOCK = threading.Lock()
+SESSIONS = {}
+FAILS = {}
+SESSION_TTL = 12 * 3600
+MAX_FAILS = 5
+LOCK_SECONDS = 600
+MAX_BODY = 2 * 1024 * 1024
+WEB_CERT = BASE + "/web.crt"
+WEB_KEY = BASE + "/web.key"
+DEFAULT_WEB_PORT = 2096
+
+
+def hash_password(pw, salt=None, iters=200000):
+    salt = salt or os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, iters)
+    return {"salt": salt.hex(), "hash": h.hex(), "iter": iters}
+
+
+def check_password(pw, web):
+    try:
+        salt = bytes.fromhex(web["salt"])
+        h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, int(web["iter"]))
+        return hmac.compare_digest(h.hex().encode(), str(web["hash"]).encode())
+    except Exception:
+        return False
+
+
+def new_session(ip):
+    sid, csrf = secrets.token_hex(32), secrets.token_hex(16)
+    now = time.time()
+    with SESS_LOCK:
+        for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
+            del SESSIONS[k]
+        SESSIONS[sid] = {"csrf": csrf, "exp": now + SESSION_TTL, "ip": ip}
+    return sid, csrf
+
+
+def get_session(sid):
+    if not sid:
+        return None
+    with SESS_LOCK:
+        s = SESSIONS.get(sid)
+        if s and s["exp"] > time.time():
+            return s
+        SESSIONS.pop(sid, None)
+    return None
+
+
+def login_locked(ip):
+    """返回还需等待的秒数，0 表示未被锁定"""
+    now = time.time()
+    with SESS_LOCK:
+        f = FAILS.get(ip)
+        if not f:
+            return 0
+        if f[0] >= MAX_FAILS:
+            left = LOCK_SECONDS - (now - f[1])
+            if left > 0:
+                return int(left) + 1
+            FAILS.pop(ip, None)
+        elif now - f[1] >= LOCK_SECONDS:
+            FAILS.pop(ip, None)
+    return 0
+
+
+def login_fail(ip):
+    now = time.time()
+    with SESS_LOCK:
+        f = FAILS.get(ip)
+        if not f or (f[0] < MAX_FAILS and now - f[1] >= LOCK_SECONDS):
+            f = [0, now]
+        f[0] += 1
+        if f[0] >= MAX_FAILS:
+            f[1] = now          # 从触发锁定的这一刻开始计时
+        FAILS[ip] = f
+
+
+def login_ok(ip):
+    with SESS_LOCK:
+        FAILS.pop(ip, None)
+
+
+def qr_svg(data):
+    """生成二维码 SVG：优先 segno（Windows 版自带），其次 qrencode 命令；都没有则返回 None"""
+    try:
+        import segno
+        buf = io.BytesIO()
+        segno.make(data, error="m").save(buf, kind="svg", scale=4, border=2)
+        return buf.getvalue().decode("utf-8")
+    except Exception:
+        pass
+    if shutil.which("qrencode"):
+        r = run(["qrencode", "-t", "SVG", "-o", "-", "-m", "2", data])
+        if r is not None and r.returncode == 0 and "<svg" in r.stdout:
+            return r.stdout
+    return None
+
+
+def kid_of(key):
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def web_state():
+    cfg = load_cfg()
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    groups, total = [], 0
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        nodes = [{"tag": t, "kid": kid_of(k), "renamed": k in s["renames"]}
+                 for t, k in zip(r.get("tags", []), r.get("keys", []))]
+        total += r.get("count", 0)
+        groups.append({"id": s["id"], "name": s["name"], "label": source_label(s, idx), "urls": s["urls"],
+                       "links": len(s["links"]), "count": r.get("count", 0),
+                       "status": r.get("status", "未刷新"), "nodes": nodes})
+    return {"version": VERSION, "ip": cfg.get("ip", ""), "port": cfg.get("port"),
+            "interval": cfg.get("interval_hours", 3), "nodes": total, "groups": groups,
+            "ready": os.path.exists(OUT_DIR + "/sub_b64.txt"),
+            "links": [{"title": t, "url": u} for t, u, _ in url_list(cfg)]}
+
+
+def web_preview(text):
+    lines = [l.strip() for l in text.replace("\r", "").split("\n") if l.strip()][:3000]
+    urls, links, unknown = classify_lines(lines)
+    known = {u for x in load_sources() for u in x["urls"]}
+    items, seen = [], set()
+    for url in urls[:20]:
+        if url in seen:
+            continue
+        seen.add(url)
+        it = {"kind": "url", "value": url}
+        if url in known:
+            it["error"] = "这个订阅地址已经添加过了"
+        else:
+            try:
+                nodes, used, skipped = fetch_url_nodes(url)
+                it.update({"count": len(nodes), "types": summarize(nodes),
+                           "used": used if used != url else "",
+                           "skipped": [[a, b] for a, b in skipped[:20]]})
+            except Exception as e:
+                it["error"] = "拉取失败: %s" % e
+        items.append(it)
+    if links:
+        good, nodes_all, skipped = [], [], []
+        for ln in links:
+            n1, s1 = parse_lines([ln])
+            if n1:
+                good.append(ln)
+                nodes_all.extend(n1)
+            else:
+                skipped.extend(s1)
+        if good:
+            items.append({"kind": "links", "value": good, "count": len(nodes_all),
+                          "types": summarize(nodes_all), "skipped": [[a, b] for a, b in skipped[:20]]})
+        else:
+            items.append({"kind": "links", "value": [], "error": "没有识别到有效的节点链接",
+                          "skipped": [[a, b] for a, b in skipped[:20]]})
+    return {"items": items, "unknown": [(u[:50] + ("…" if len(u) > 50 else "")) for u in unknown[:20]]}
+
+
+def web_commit(items):
+    if not isinstance(items, list) or not items or len(items) > 50:
+        raise ValueError("没有可添加的内容")
+    sources = load_sources()
+    errors, added = [], 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip()
+        if name:
+            name = clean_name(name, 30)
+            if name is None:
+                errors.append("节点组名称无效（不能含换行，最长 30 个字符）")
+                continue
+        if it.get("kind") == "url":
+            url = str(it.get("value", "")).strip()
+            if not re.match(r"^https?://", url, re.I) or len(url) > 2000:
+                errors.append("订阅地址格式不对")
+                continue
+            merge_into_sources(sources, name, urls=[url])
+            added += 1
+        elif it.get("kind") == "links":
+            raw = it.get("value")
+            if not isinstance(raw, list) or len(raw) > 5000:
+                errors.append("节点链接格式不对")
+                continue
+            good = [str(l).strip() for l in raw if str(l).strip() and parse_lines([str(l).strip()])[0]]
+            if not good:
+                errors.append("没有有效的节点链接")
+                continue
+            merge_into_sources(sources, name, links=good)
+            added += 1
+    if added:
+        save_sources(sources)
+    n = do_refresh(verbose=False) if added else 0
+    return {"nodes": n, "added": added, "errors": errors}
+
+
+def delete_source_cache(s):
+    try:
+        for fn in os.listdir(CACHE_DIR):
+            if fn == s["id"] + ".json" or fn.startswith(s["id"] + "-"):
+                os.unlink(os.path.join(CACHE_DIR, fn))
+    except Exception:
+        pass
+
+
+def web_group_rename(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("id")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    new = (b.get("name") or "").strip()
+    if new:
+        new = clean_name(new, 30)
+        if new is None:
+            raise ValueError("名称无效（不能含换行，最长 30 个字符）")
+        if any(o is not s and o["name"].lower() == new.lower() for o in sources):
+            raise ValueError("已有其他节点组叫这个名字")
+    s["name"] = new
+    save_sources(sources)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_group_delete(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("id")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    sources.remove(s)
+    save_sources(sources)
+    delete_source_cache(s)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_node_rename(b):
+    sources = load_sources()
+    s = next((x for x in sources if x["id"] == b.get("group")), None)
+    if s is None:
+        raise ValueError("找不到这个节点组")
+    r = read_json(REPORT_FILE, {}).get(s["id"], {})
+    key = next((k for k in r.get("keys", []) if kid_of(k) == b.get("kid")), None)
+    if key is None:
+        raise ValueError("找不到这个节点，请刷新后重试")
+    new = (b.get("name") or "").strip()
+    if not new:
+        s["renames"].pop(key, None)
+    else:
+        name = clean_name(new, 60)
+        if name is None:
+            raise ValueError("名称无效（不能含换行，最长 60 个字符）")
+        if name in RESERVED_TAGS or name in {x["tag"] for x in load_services()}:
+            raise ValueError("这个名称是系统保留的分组名，请换一个")
+        s["renames"][key] = name
+    save_sources(sources)
+    do_refresh(verbose=False)
+    return {"ok": True}
+
+
+def web_settings(b):
+    try:
+        h = int(b.get("interval"))
+    except (TypeError, ValueError):
+        raise ValueError("刷新间隔必须是 1-168 之间的整数")
+    if not (1 <= h <= 168):
+        raise ValueError("刷新间隔必须是 1-168 之间的整数")
+    cfg = load_cfg()
+    cfg["interval_hours"] = h
+    save_cfg(cfg)
+    try:
+        write_units(cfg)
+        sc("restart", "msub-refresh.timer")
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def web_new_token():
+    cfg = load_cfg()
+    cfg["token"] = os.urandom(8).hex()
+    save_cfg(cfg)
+    return {"ok": True}
+
+
+def web_change_password(b, keep_sid):
+    cfg = load_cfg()
+    web = cfg.get("web") or {}
+    if not check_password(str(b.get("old", "")), web):
+        raise ValueError("当前密码不正确")
+    new = str(b.get("new", ""))
+    if len(new) < 8:
+        raise ValueError("新密码至少 8 位")
+    web.update(hash_password(new))
+    cfg["web"] = web
+    save_cfg(cfg)
+    with SESS_LOCK:                      # 其他已登录的会话全部作废
+        for k in [k for k in SESSIONS if k != keep_sid]:
+            del SESSIONS[k]
+    return {"ok": True}
+
+
+class AdminHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "msub"
+    sys_version = ""
+    timeout = 30
+
+    def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(10)
+            self.request.do_handshake()
+        http.server.BaseHTTPRequestHandler.setup(self)
+
+    def log_message(self, fmt, *args):
+        return
+
+    # ---- 工具 ----
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj, headers=None):
+        self._send(code, json.dumps(obj, ensure_ascii=False), headers=headers)
+
+    def _sid(self):
+        c = http.cookies.SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        m = c.get("msub_sid")
+        return m.value if m else ""
+
+    def _is_tls(self):
+        return isinstance(self.request, ssl.SSLSocket)
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        return urllib.parse.urlsplit(origin).netloc == self.headers.get("Host", "")
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            raise ValueError("请求内容过大或格式不对")
+        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            obj = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            raise ValueError("请求格式错误")
+        if not isinstance(obj, dict):
+            raise ValueError("请求格式错误")
+        return obj
+
+    # ---- GET ----
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        path, query = u.path, urllib.parse.parse_qs(u.query)
+        if path == "/":
+            return self._send(302, b"", headers={"Location": "/admin"})
+        if path in ("/admin", "/admin/"):
+            nonce = secrets.token_urlsafe(16)
+            csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; img-src 'self' blob: data:; "
+                   "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" % (nonce, nonce))
+            return self._send(200, ADMIN_HTML.replace("__NONCE__", nonce), "text/html; charset=utf-8",
+                              {"Content-Security-Policy": csp})
+        if not path.startswith("/admin/api/"):
+            return self._json(404, {"error": "not found"})
+        s = get_session(self._sid())
+        if path == "/admin/api/session":
+            return self._json(200, {"authed": bool(s), "csrf": s["csrf"] if s else ""})
+        if not s:
+            return self._json(401, {"error": "未登录"})
+        if path == "/admin/api/state":
+            return self._json(200, web_state())
+        if path == "/admin/api/qr":
+            items = url_list(load_cfg())
+            try:
+                kind = int(query.get("kind", ["-1"])[0])
+                data = items[kind][2]
+            except (ValueError, IndexError):
+                return self._json(400, {"error": "参数错误"})
+            svg = qr_svg(data)
+            if svg is None:
+                return self._json(501, {"error": "服务器没有二维码工具。请在服务器运行 msub 选择「订阅二维码」自动安装，或执行 apt install qrencode"})
+            return self._send(200, svg, "image/svg+xml; charset=utf-8")
+        self._json(404, {"error": "not found"})
+
+    # ---- POST ----
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if not self._origin_ok():
+            return self._json(403, {"error": "请求来源不合法"})
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        if path == "/admin/api/login":
+            return self._login(body)
+        sid = self._sid()
+        s = get_session(sid)
+        if not s:
+            return self._json(401, {"error": "未登录"})
+        tok = self.headers.get("X-CSRF-Token", "")
+        if not hmac.compare_digest(tok.encode("utf-8", "ignore"), s["csrf"].encode()):
+            return self._json(403, {"error": "安全校验失败，请刷新页面后重试"})
+        try:
+            with WEB_LOCK:
+                result = self._dispatch(path, body, sid)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except Exception as e:
+            return self._json(500, {"error": "服务器内部错误: %s" % e})
+        if result is None:
+            return self._json(404, {"error": "not found"})
+        self._json(200, result)
+
+    def _login(self, body):
+        ip = self.client_address[0]
+        wait = login_locked(ip)
+        if wait:
+            return self._json(429, {"error": "尝试次数过多，请 %d 分钟后再试" % (wait // 60 + 1)})
+        web = load_cfg().get("web") or {}
+        if not web.get("enabled") or not web.get("hash"):
+            return self._json(403, {"error": "网页管理未开启"})
+        if check_password(str(body.get("password", "")), web):
+            login_ok(ip)
+            sid, csrf = new_session(ip)
+            cookie = "msub_sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (
+                sid, SESSION_TTL, "; Secure" if self._is_tls() else "")
+            return self._json(200, {"ok": True, "csrf": csrf}, headers={"Set-Cookie": cookie})
+        login_fail(ip)
+        time.sleep(0.8)
+        return self._json(401, {"error": "密码错误"})
+
+    def _dispatch(self, path, b, sid):
+        if not path.startswith("/admin/api/"):
+            return None
+        p = path[len("/admin/api/"):]
+        if p == "logout":
+            with SESS_LOCK:
+                SESSIONS.pop(sid, None)
+            return {"ok": True}
+        if p == "add/preview":
+            return web_preview(str(b.get("text", "")))
+        if p == "add/commit":
+            return web_commit(b.get("items"))
+        if p == "group/rename":
+            return web_group_rename(b)
+        if p == "group/delete":
+            return web_group_delete(b)
+        if p == "node/rename":
+            return web_node_rename(b)
+        if p == "refresh":
+            return {"nodes": do_refresh(verbose=False)}
+        if p == "settings":
+            return web_settings(b)
+        if p == "token":
+            return web_new_token()
+        if p == "password":
+            return web_change_password(b, sid)
+        return None
+
+
+class TLSServer(Server):
+    ctx = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+def ensure_web_cert(ip):
+    if os.path.exists(WEB_CERT) and os.path.exists(WEB_KEY):
+        return True
+    if not shutil.which("openssl"):
+        return False
+    san = "IP:%s" % ip if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip or "") else "DNS:localhost"
+    r = run(["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048", "-keyout", WEB_KEY, "-out", WEB_CERT,
+             "-days", "3650", "-subj", "/CN=msub", "-addext", "subjectAltName=" + san])
+    if r is None or r.returncode != 0 or not os.path.exists(WEB_CERT):
+        return False
+    os.chmod(WEB_KEY, 0o600)
+    return True
+
+
+def make_admin_server(web):
+    port = int(web["port"])
+    if web.get("https") and os.path.exists(WEB_CERT) and os.path.exists(WEB_KEY):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(WEB_CERT, WEB_KEY)
+        srv = TLSServer(("", port), AdminHandler)
+        srv.ctx = ctx
+        return srv
+    return Server(("", port), AdminHandler)
+
+
+def web_url(cfg):
+    web = cfg.get("web") or {}
+    return "%s://%s:%s/admin" % ("https" if web.get("https") else "http", cfg.get("ip", "你的IP"), web.get("port", DEFAULT_WEB_PORT))
+
+
+def ask_secret(prompt):
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def web_enable(cfg):
+    web = dict(cfg.get("web") or {})
+    pw = ask_secret("设置网页登录密码（至少 8 位，输入时不显示）: ")
+    if len(pw) < 8:
+        print("❌ 密码至少 8 位。")
+        return
+    if ask_secret("再输入一次: ") != pw:
+        print("❌ 两次输入不一致。")
+        return
+    cur_port = web.get("port")
+    while True:
+        v = ask("网页管理端口 [直接回车使用 %s]: " % (cur_port or DEFAULT_WEB_PORT), str(cur_port or DEFAULT_WEB_PORT))
+        if not (v.isdigit() and 1 <= int(v) <= 65535):
+            print("❌ 端口必须是 1-65535 之间的数字。")
+            continue
+        if int(v) == int(cfg.get("port", 0)):
+            print("❌ 不能和订阅端口相同。")
+            continue
+        if cur_port and int(v) == int(cur_port) and web.get("enabled"):
+            break
+        if not port_free(int(v)):
+            print("❌ 端口 %s 已被占用，请换一个。" % v)
+            continue
+        break
+    web.update(hash_password(pw))
+    web["port"] = int(v)
+    web["enabled"] = True
+    if web.get("https", True):
+        if ensure_web_cert(cfg.get("ip", "")):
+            web["https"] = True
+        else:
+            web["https"] = False
+            print("⚠️  没有 openssl，无法生成证书，网页管理将使用 HTTP（密码会明文传输）。")
+    old_port = int(cur_port) if cur_port else None
+    cfg["web"] = web
+    save_cfg(cfg)
+    open_firewall(int(v))
+    if old_port and old_port != int(v):
+        close_firewall(old_port)
+    sc("restart", "msub-web")
+    print("✅ 网页管理已开启: %s" % web_url(cfg))
+    if web["https"]:
+        print("ℹ️  使用自签名证书，浏览器第一次会提示「不安全」，选择继续访问即可，传输内容仍是加密的。")
+    print("⚠️  请在云安全组放行 TCP %s。" % v)
+
+
+def web_menu():
+    cfg = ensure_cfg()
+    while True:
+        cfg = load_cfg()
+        web = cfg.get("web") or {}
+        on = bool(web.get("enabled") and web.get("hash"))
+        print(LINE)
+        print("  网页管理界面（用手机或电脑浏览器管理节点、查看订阅和二维码）")
+        print("  状态: %s" % (("已开启    地址: " + web_url(cfg)) if on else "未开启"))
+        print("  1. %s" % ("重新设置密码 / 端口" if on else "开启（设置密码和端口）"))
+        print("  2. 关闭")
+        print("  3. 切换 HTTPS（当前: %s）" % ("开" if web.get("https") else "关"))
+        print("  0. 返回")
+        print(LINE)
+        c = ask("请选择 [0-3]: ", "0")
+        if c == "1":
+            web_enable(cfg)
+        elif c == "2":
+            if on:
+                web["enabled"] = False
+                cfg["web"] = web
+                save_cfg(cfg)
+                if web.get("port"):
+                    close_firewall(int(web["port"]))
+                sc("restart", "msub-web")
+                print("✅ 网页管理已关闭。")
+            else:
+                print("ℹ️  本来就是关闭的。")
+        elif c == "3":
+            if not web.get("hash"):
+                print("ℹ️  请先开启网页管理。")
+                continue
+            if web.get("https"):
+                web["https"] = False
+                print("⚠️  已切换为 HTTP，登录密码将明文传输，仅建议在可信网络下使用。")
+            elif ensure_web_cert(cfg.get("ip", "")):
+                web["https"] = True
+                print("✅ 已切换为 HTTPS（自签名证书）。")
+            else:
+                print("❌ 没有 openssl，无法生成证书。")
+                continue
+            cfg["web"] = web
+            save_cfg(cfg)
+            sc("restart", "msub-web")
+            print("   地址: %s" % web_url(cfg))
+        else:
+            return
+
+
+
+ADMIN_HTML = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex,nofollow">
+<title>msub 管理</title>
+<style nonce="__NONCE__">
+:root{--bg:#f5f6f8;--card:#fff;--text:#1d2129;--muted:#6b7280;--accent:#2563eb;--danger:#dc2626;--border:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111827;--card:#1f2937;--text:#f3f4f6;--muted:#9ca3af;--accent:#60a5fa;--danger:#f87171;--border:#374151}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+header b{flex:1}
+nav{display:flex;gap:6px;padding:10px 14px;overflow-x:auto;max-width:900px;margin:0 auto}
+main{padding:0 14px 48px;max-width:900px;margin:0 auto}
+h2,h3{margin:0 0 8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px}
+.narrow{max-width:420px;margin:48px auto}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.spread{justify-content:space-between}
+.muted{color:var(--muted)}
+.err{color:var(--danger)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+.small{font-size:13px}
+button{font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;white-space:nowrap}
+button.ghost{background:transparent;color:var(--accent)}
+button.danger{background:transparent;color:var(--danger);border-color:var(--danger)}
+button.small{padding:3px 9px;font-size:13px}
+button:disabled{opacity:.6;cursor:default}
+.tab{background:transparent;color:var(--text);border-color:var(--border)}
+.tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+input[type=text],input[type=password],input[type=number],textarea{font:inherit;width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)}
+input[type=number]{width:90px}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+details summary{cursor:pointer;margin:8px 0}
+.node{padding:3px 0;border-bottom:1px dashed var(--border)}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 16px;border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw;z-index:30}
+#toast.show{opacity:.95}
+#toast.err{background:#b91c1c}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20}
+.overlay[hidden]{display:none}
+.overlay .card{margin:0;text-align:center}
+#qrImg{width:260px;max-width:70vw;background:#fff;padding:8px;border-radius:8px}
+.offscreen{position:fixed;left:-9999px;top:0}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="login" class="card narrow" hidden>
+  <h2>msub 管理登录</h2>
+  <input id="pw" type="password" placeholder="登录密码" autocomplete="current-password">
+  <div class="row"><button id="loginBtn">登录</button></div>
+  <p id="loginErr" class="err"></p>
+</div>
+
+<div id="app" hidden>
+  <header><b>msub 订阅合并工具 <small id="ver" class="muted"></small></b><button id="logoutBtn" class="ghost small">退出登录</button></header>
+  <nav>
+    <button class="tab active" data-tab="links">订阅链接</button>
+    <button class="tab" data-tab="groups">节点组</button>
+    <button class="tab" data-tab="add">添加节点</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
+  <main>
+    <section id="tab-links"></section>
+    <section id="tab-groups" hidden></section>
+    <section id="tab-add" hidden>
+      <div class="card">
+        <p class="muted">粘贴订阅地址或节点链接（可混合、多行），然后点「检查」。</p>
+        <textarea id="addText" rows="7" spellcheck="false" placeholder="https://其他VPS的订阅地址&#10;vless://...&#10;hysteria2://..."></textarea>
+        <div class="row"><button id="addCheck">检查</button></div>
+      </div>
+      <datalist id="groupNames"></datalist>
+      <div id="addResult"></div>
+    </section>
+    <section id="tab-settings" hidden>
+      <div class="card" id="infoCard"></div>
+      <div class="card">
+        <h3>自动刷新</h3>
+        <div class="row"><span>每</span><input id="interval" type="number" min="1" max="168"><span>小时刷新一次</span><button id="saveInterval">保存</button></div>
+        <div class="row"><button id="refreshBtn" class="ghost">立即刷新</button><button id="tokenBtn" class="danger">更换订阅 token</button></div>
+      </div>
+      <div class="card">
+        <h3>修改网页登录密码</h3>
+        <input id="oldPw" type="password" placeholder="当前密码" autocomplete="current-password">
+        <div class="row"><input id="newPw" type="password" placeholder="新密码（至少 8 位）" autocomplete="new-password"></div>
+        <div class="row"><button id="pwBtn">修改密码</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+<div id="qrBox" class="overlay" hidden>
+  <div class="card narrow">
+    <h3 id="qrTitle"></h3>
+    <img id="qrImg" alt="二维码">
+    <p id="qrMsg" class="muted"></p>
+    <button id="qrClose">关闭</button>
+  </div>
+</div>
+
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+  var csrf = "";
+  var state = null;
+  var pendingItems = [];
+  var toastTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+  function clear(n) { while (n.firstChild) { n.removeChild(n.firstChild); } }
+  function el(tag, props, kids) {
+    var e = document.createElement(tag);
+    var k;
+    props = props || {};
+    for (k in props) {
+      if (!Object.prototype.hasOwnProperty.call(props, k)) { continue; }
+      if (k === "class") { e.className = props[k]; }
+      else if (k === "text") { e.textContent = props[k]; }
+      else if (k.slice(0, 2) === "on") { e.addEventListener(k.slice(2), props[k]); }
+      else { e.setAttribute(k, props[k]); }
+    }
+    (kids || []).forEach(function (c) {
+      if (c === null || c === undefined) { return; }
+      e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return e;
+  }
+  function toast(msg, isErr) {
+    var t = $("toast");
+    t.textContent = msg;
+    t.className = "show" + (isErr ? " err" : "");
+    if (toastTimer) { clearTimeout(toastTimer); }
+    toastTimer = setTimeout(function () { t.className = ""; }, 3500);
+  }
+  function fail(e) { toast(e && e.message ? e.message : "操作失败", true); }
+
+  function api(method, path, body) {
+    var opt = { method: method, headers: {}, credentials: "same-origin" };
+    if (method !== "GET") {
+      opt.headers["Content-Type"] = "application/json";
+      opt.headers["X-CSRF-Token"] = csrf;
+      opt.body = JSON.stringify(body || {});
+    }
+    return fetch("/admin/api/" + path, opt).then(function (r) {
+      return r.json().then(function (j) { return { r: r, j: j }; },
+        function () { return { r: r, j: { error: "服务器返回了无法识别的内容" } }; });
+    }).then(function (x) {
+      if (x.r.status === 401 && path !== "login") { showLogin(); throw new Error("登录已过期，请重新登录"); }
+      if (!x.r.ok || x.j.error) { throw new Error(x.j.error || ("请求失败 " + x.r.status)); }
+      return x.j;
+    });
+  }
+
+  function showLogin() { $("app").hidden = true; $("login").hidden = false; $("pw").value = ""; }
+  function showApp() { $("login").hidden = true; $("app").hidden = false; return loadState(); }
+  function loadState() {
+    return api("GET", "state").then(function (j) { state = j; renderAll(); }).catch(fail);
+  }
+  function showTab(name) {
+    ["links", "groups", "add", "settings"].forEach(function (t) { $("tab-" + t).hidden = (t !== name); });
+    var tabs = document.querySelectorAll(".tab");
+    var i;
+    for (i = 0; i < tabs.length; i++) {
+      tabs[i].classList.toggle("active", tabs[i].getAttribute("data-tab") === name);
+    }
+  }
+
+  function copyText(text) {
+    function fallback() {
+      var ta = el("textarea", {});
+      ta.value = text;
+      ta.className = "offscreen";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      toast(ok ? "已复制" : "复制失败，请长按选中后手动复制", !ok);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { toast("已复制"); }, fallback);
+    } else { fallback(); }
+  }
+
+  function showQr(i, title) {
+    $("qrTitle").textContent = title;
+    $("qrMsg").textContent = "加载中…";
+    $("qrImg").removeAttribute("src");
+    $("qrBox").hidden = false;
+    fetch("/admin/api/qr?kind=" + i, { credentials: "same-origin" }).then(function (r) {
+      var ct = r.headers.get("Content-Type") || "";
+      if (ct.indexOf("svg") >= 0) {
+        return r.text().then(function (svg) {
+          $("qrImg").src = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+          $("qrMsg").textContent = "用客户端扫描二维码导入";
+        });
+      }
+      return r.json().then(function (j) { $("qrMsg").textContent = j.error || "获取二维码失败"; });
+    }).catch(function (e) { $("qrMsg").textContent = e.message; });
+  }
+
+  /* ---------- 订阅链接 ---------- */
+  function renderLinks() {
+    var box = $("tab-links");
+    clear(box);
+    if (!state.ready) {
+      box.appendChild(el("p", { "class": "muted", text: "还没有可用订阅，请先到「添加节点」页面添加。" }));
+      return;
+    }
+    box.appendChild(el("p", { "class": "muted", text: "订阅链接含全部节点密码，请勿公开分享。" }));
+    state.links.forEach(function (it, i) {
+      box.appendChild(el("div", { "class": "card" }, [
+        el("b", { text: it.title }),
+        el("div", { "class": "mono small", text: it.url }),
+        el("div", { "class": "row" }, [
+          el("button", { text: "复制", onclick: function () { copyText(it.url); } }),
+          el("button", { "class": "ghost", text: "二维码", onclick: function () { showQr(i, it.title); } })
+        ])
+      ]));
+    });
+  }
+
+  /* ---------- 节点组 ---------- */
+  function renameGroup(g) {
+    var v = window.prompt("新的节点组名称（留空 = 不加前缀）", g.name);
+    if (v === null) { return; }
+    api("POST", "group/rename", { id: g.id, name: v }).then(function () { toast("已改名"); return loadState(); }).catch(fail);
+  }
+  function deleteGroup(g) {
+    if (!window.confirm("确定删除节点组「" + g.label + "」及其所有节点吗？")) { return; }
+    api("POST", "group/delete", { id: g.id }).then(function () { toast("已删除"); return loadState(); }).catch(fail);
+  }
+  function renameNode(g, n) {
+    var v = window.prompt("新的节点名称（留空 = 恢复默认名称）", n.tag);
+    if (v === null) { return; }
+    api("POST", "node/rename", { group: g.id, kid: n.kid, name: v }).then(function () { toast("已改名"); return loadState(); }).catch(fail);
+  }
+  function renderGroups() {
+    var box = $("tab-groups");
+    clear(box);
+    if (!state.groups.length) {
+      box.appendChild(el("p", { "class": "muted", text: "还没有节点组，请先到「添加节点」页面添加。" }));
+      return;
+    }
+    state.groups.forEach(function (g) {
+      var parts = [];
+      if (g.urls.length) { parts.push("订阅地址 " + g.urls.length + " 个"); }
+      if (g.links) { parts.push("粘贴节点 " + g.links + " 条"); }
+      var card = el("div", { "class": "card" }, [
+        el("div", { "class": "row spread" }, [
+          el("b", { text: g.label }),
+          el("span", { "class": "muted", text: "节点 " + g.count + " 个" })
+        ]),
+        el("div", { "class": "muted small", text: parts.join(" + ") + " · " + g.status })
+      ]);
+      g.urls.forEach(function (u) { card.appendChild(el("div", { "class": "mono small muted", text: u })); });
+      var det = el("details", {}, [el("summary", { text: "查看节点 (" + g.nodes.length + ")" })]);
+      g.nodes.forEach(function (n) {
+        det.appendChild(el("div", { "class": "row spread node" }, [
+          el("span", { text: n.tag + (n.renamed ? "  ✎" : "") }),
+          el("button", { "class": "ghost small", text: "改名", onclick: function () { renameNode(g, n); } })
+        ]));
+      });
+      card.appendChild(det);
+      card.appendChild(el("div", { "class": "row" }, [
+        el("button", { "class": "ghost", text: "改节点组名称", onclick: function () { renameGroup(g); } }),
+        el("button", { "class": "danger", text: "删除节点组", onclick: function () { deleteGroup(g); } })
+      ]));
+      box.appendChild(card);
+    });
+  }
+
+  /* ---------- 添加节点 ---------- */
+  function renderAddNames() {
+    var dl = $("groupNames");
+    clear(dl);
+    state.groups.forEach(function (g) { if (g.name) { dl.appendChild(el("option", { value: g.name })); } });
+  }
+  function showPreview(j) {
+    var box = $("addResult");
+    clear(box);
+    (j.unknown || []).forEach(function (u) {
+      box.appendChild(el("p", { "class": "muted small", text: "无法识别，已忽略：" + u }));
+    });
+    if (!j.items.length) {
+      box.appendChild(el("p", { "class": "err", text: "没有识别到任何订阅地址或节点链接。" }));
+      return;
+    }
+    var any = false;
+    j.items.forEach(function (it) {
+      var title = it.kind === "url" ? it.value : "粘贴的节点链接";
+      var card = el("div", { "class": "card" }, [el("div", { "class": "mono small", text: title })]);
+      if (it.error) {
+        card.appendChild(el("div", { "class": "err", text: it.error }));
+      } else {
+        any = true;
+        card.appendChild(el("div", { text: "解析到 " + it.count + " 个节点：" + (it.types || "") }));
+        if (it.used) { card.appendChild(el("div", { "class": "muted small", text: "已自动改用更完整的地址：" + it.used })); }
+        (it.skipped || []).forEach(function (s) {
+          card.appendChild(el("div", { "class": "muted small", text: "跳过：" + s[0] + "（" + s[1] + "）" }));
+        });
+        var nameEl = el("input", { type: "text", list: "groupNames", placeholder: "节点组名称，如 US（选已有名称=并入；留空=不加前缀）" });
+        var chk = el("input", { type: "checkbox", checked: "checked" });
+        it._nameEl = nameEl;
+        it._chkEl = chk;
+        card.appendChild(el("div", { "class": "row" }, [el("label", {}, [chk, " 添加"])]));
+        card.appendChild(el("div", { "class": "row" }, [nameEl]));
+      }
+      box.appendChild(card);
+    });
+    if (any) { box.appendChild(el("div", { "class": "row" }, [el("button", { id: "commitBtn", text: "生成合并链接", onclick: commitAdd })])); }
+  }
+  function checkAdd() {
+    var text = $("addText").value;
+    if (!text.trim()) { toast("请先粘贴内容", true); return; }
+    $("addCheck").disabled = true;
+    $("addCheck").textContent = "检查中…";
+    api("POST", "add/preview", { text: text }).then(function (j) {
+      pendingItems = j.items;
+      showPreview(j);
+    }).catch(fail).then(function () {
+      $("addCheck").disabled = false;
+      $("addCheck").textContent = "检查";
+    });
+  }
+  function commitAdd() {
+    var items = [];
+    pendingItems.forEach(function (it) {
+      if (it.error || !it._chkEl || !it._chkEl.checked) { return; }
+      items.push({ kind: it.kind, value: it.value, name: it._nameEl.value.trim() });
+    });
+    if (!items.length) { toast("没有可添加的内容", true); return; }
+    var btn = $("commitBtn");
+    if (btn) { btn.disabled = true; }
+    api("POST", "add/commit", { items: items }).then(function (j) {
+      var msg = "已合并，共 " + j.nodes + " 个节点";
+      if (j.errors && j.errors.length) { msg += "（" + j.errors.length + " 项未添加）"; }
+      toast(msg, !!(j.errors && j.errors.length));
+      $("addText").value = "";
+      clear($("addResult"));
+      pendingItems = [];
+      return loadState().then(function () { showTab("links"); });
+    }).catch(fail).then(function () { if (btn) { btn.disabled = false; } });
+  }
+
+  /* ---------- 设置 ---------- */
+  function renderSettings() {
+    var box = $("infoCard");
+    clear(box);
+    box.appendChild(el("h3", { text: "运行信息" }));
+    [["脚本版本", "v" + state.version], ["服务器 IP", state.ip], ["订阅端口", String(state.port)],
+     ["节点总数", String(state.nodes)], ["节点组数", String(state.groups.length)]].forEach(function (p) {
+      box.appendChild(el("div", { "class": "row spread" }, [el("span", { "class": "muted", text: p[0] }), el("span", { text: p[1] })]));
+    });
+    $("interval").value = state.interval;
+  }
+
+  function renderAll() {
+    $("ver").textContent = "v" + state.version;
+    renderLinks();
+    renderGroups();
+    renderAddNames();
+    renderSettings();
+  }
+
+  function doLogin() {
+    api("POST", "login", { password: $("pw").value }).then(function (j) {
+      csrf = j.csrf;
+      $("loginErr").textContent = "";
+      return showApp();
+    }).catch(function (e) { $("loginErr").textContent = e.message; });
+  }
+
+  function bind() {
+    $("loginBtn").addEventListener("click", doLogin);
+    $("pw").addEventListener("keydown", function (e) { if (e.key === "Enter") { doLogin(); } });
+    $("logoutBtn").addEventListener("click", function () {
+      api("POST", "logout", {}).catch(function () { return null; }).then(showLogin);
+    });
+    var tabs = document.querySelectorAll(".tab");
+    var i;
+    for (i = 0; i < tabs.length; i++) {
+      (function (b) { b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); }); })(tabs[i]);
+    }
+    $("addCheck").addEventListener("click", checkAdd);
+    $("qrClose").addEventListener("click", function () { $("qrBox").hidden = true; });
+    $("saveInterval").addEventListener("click", function () {
+      api("POST", "settings", { interval: parseInt($("interval").value, 10) }).then(function () { toast("已保存"); return loadState(); }).catch(fail);
+    });
+    $("refreshBtn").addEventListener("click", function () {
+      toast("正在刷新…");
+      api("POST", "refresh", {}).then(function (j) { toast("刷新完成，共 " + j.nodes + " 个节点"); return loadState(); }).catch(fail);
+    });
+    $("tokenBtn").addEventListener("click", function () {
+      if (!window.confirm("更换后所有订阅链接都会变化，已导入客户端的订阅需要重新添加。确定吗？")) { return; }
+      api("POST", "token", {}).then(function () { toast("订阅 token 已更换"); return loadState(); }).catch(fail);
+    });
+    $("pwBtn").addEventListener("click", function () {
+      api("POST", "password", { old: $("oldPw").value, "new": $("newPw").value }).then(function () {
+        $("oldPw").value = "";
+        $("newPw").value = "";
+        toast("密码已修改");
+      }).catch(fail);
+    });
+  }
+
+  function start() {
+    bind();
+    api("GET", "session").then(function (j) {
+      if (j.authed) { csrf = j.csrf; return showApp(); }
+      showLogin();
+      return null;
+    }).catch(function () { showLogin(); });
+  }
+  start();
+})();
+</script>
+</body>
+</html>
+'''
+
+
+def do_serve():
+    cfg = load_cfg()
+    if not cfg:
+        die("❌ 尚未初始化。")
+    web = cfg.get("web") or {}
+    if web.get("enabled") and web.get("hash"):
+        try:
+            adm = make_admin_server(web)
+            threading.Thread(target=adm.serve_forever, daemon=True).start()
+        except Exception as e:
+            print("网页管理启动失败: %s" % e, flush=True)
+    Server(("", int(cfg["port"])), Handler).serve_forever()
+
+
+# ============================================================
+#  系统服务 / 初始化
+# ============================================================
+
+def write_units(cfg):
+    py = sys.executable or "/usr/bin/python3"
+    write_atomic(WEB_UNIT, """[Unit]
+Description=msub subscription web service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s %s serve
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+""" % (py, BIN_PATH), 0o644)
+    write_atomic(REFRESH_UNIT, """[Unit]
+Description=msub refresh subscriptions
+
+[Service]
+Type=oneshot
+ExecStart=%s %s refresh --quiet
+""" % (py, BIN_PATH), 0o644)
+    write_atomic(TIMER_UNIT, """[Unit]
+Description=msub periodic refresh
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=%sh
+
+[Install]
+WantedBy=timers.target
+""" % cfg.get("interval_hours", 3), 0o644)
+    sc("daemon-reload")
+
+
+def install_self():
+    me = os.path.realpath(sys.argv[0])
+    if me != os.path.realpath(BIN_PATH) and os.path.isfile(me):
+        try:
+            shutil.copy(me, BIN_PATH)
+            os.chmod(BIN_PATH, 0o755)
+        except Exception:
+            pass
+
+
+def setup():
+    need_root()
+    for d in (BASE, CACHE_DIR, OUT_DIR):
+        os.makedirs(d, exist_ok=True)
+    os.chmod(BASE, 0o700)
+    install_self()
+    cfg = load_cfg()
+    first = not cfg
+    if first:
+        print(LINE)
+        print("  首次使用，先做一次初始化")
+        print(LINE)
+        while True:
+            v = input("订阅服务监听端口 [直接回车使用 %d]: " % DEFAULT_PORT).strip() or str(DEFAULT_PORT)
+            if v.isdigit() and 1 <= int(v) <= 65535:
+                if port_free(int(v)):
+                    cfg["port"] = int(v)
+                    break
+                print("❌ 端口 %s 已被占用，请换一个。" % v)
+            else:
+                print("❌ 端口必须是 1-65535 之间的数字。")
+        cfg["token"] = os.urandom(8).hex()
+        cfg["interval_hours"] = 3
+    if not cfg.get("ip"):
+        ip = get_public_ip()
+        if not ip:
+            ip = input("❌ 自动获取公网 IP 失败，请手动输入本机公网 IP: ").strip()
+        cfg["ip"] = ip
+    save_cfg(cfg)
+    write_units(cfg)
+    sc("enable", "msub-web")
+    sc("restart", "msub-web")
+    sc("enable", "--now", "msub-refresh.timer")
+    open_firewall(int(cfg["port"]))
+    if first:
+        print("✅ 初始化完成。订阅服务端口: %s（请在云安全组放行 TCP %s）" % (cfg["port"], cfg["port"]))
+    return cfg
+
+
+def ensure_cfg():
+    cfg = load_cfg()
+    if cfg.get("token") and cfg.get("port"):
+        return cfg
+    return setup()
+
+
+# ============================================================
+#  订阅地址 / 二维码
+# ============================================================
+
+def url_list(cfg):
+    b = base_url(cfg)
+    return [
+        ("通用订阅（小火箭 / V2rayN / v2rayNG / NekoBox）", b + "/sub", b + "/sub"),
+        ("sing-box 苹果端 - 全局代理", b + "/singbox",
+         "sing-box://import-remote-profile?url=%s#Merge-Global" % quote(b + "/singbox")),
+        ("sing-box 苹果端 - 大陆直连分流（含 Telegram / YouTube / Claude 等指定分流）", b + "/singbox-cn",
+         "sing-box://import-remote-profile?url=%s#Merge-CN" % quote(b + "/singbox-cn")),
+        ("Clash Meta / Mihomo", b + "/clash", b + "/clash"),
+    ]
+
+
+def ensure_qrencode():
+    if shutil.which("qrencode"):
+        return True
+    print("==> 安装二维码工具 qrencode...")
+    if shutil.which("apt-get"):
+        run(["apt-get", "update", "-y"])
+        run(["apt-get", "install", "-y", "qrencode"])
+    elif shutil.which("dnf"):
+        run(["dnf", "install", "-y", "qrencode"])
+    elif shutil.which("yum"):
+        run(["yum", "install", "-y", "qrencode"])
+    return bool(shutil.which("qrencode"))
+
+
+def show_urls(cfg, qr=False, only=None):
+    print(LINE)
+    items = url_list(cfg)
+    if only is not None:
+        items = [items[only]]
+    have_qr = ensure_qrencode() if qr else False
+    for title, url, qrdata in items:
+        print("🔗 %s" % title)
+        print("   %s" % url)
+        if qr:
+            if have_qr:
+                r = run(["qrencode", "-t", "ANSIUTF8", qrdata])
+                if r:
+                    print(r.stdout)
+            else:
+                print("   （未能安装 qrencode，无法显示二维码）")
+        print("")
+    print("⚠️  订阅链接含全部节点密码，请勿公开分享。")
+    print("⚠️  请确认云安全组已放行 TCP %s。" % cfg.get("port"))
+    print(LINE)
+
+
+# ============================================================
+#  交互: 添加 / 查看 / 删除节点组
+# ============================================================
+
+def new_id(sources):
+    used = {s["id"] for s in sources}
+    while True:
+        i = os.urandom(3).hex()
+        if i not in used:
+            return i
+
+
+def summarize(nodes):
+    cnt = {}
+    for n in nodes:
+        cnt[n["out"]["type"]] = cnt.get(n["out"]["type"], 0) + 1
+    return "、".join("%s×%d" % (k, v) for k, v in cnt.items())
+
+
+def ask(prompt, default=""):
+    try:
+        v = input(prompt)
+    except EOFError:
+        return default
+    v = v.strip()
+    return v if v else default
+
+
+def read_pasted_lines(allow_cancel=False):
+    """读取粘贴内容，空行结束。allow_cancel 时，第一行输入 0 / q 表示取消，返回 None"""
+    lines = []
+    while True:
+        try:
+            ln = input()
+        except EOFError:
+            break
+        if not ln.strip():
+            if lines:
+                break
+            continue
+        if allow_cancel and not lines and ln.strip().lower() in ("0", "q"):
+            return None
+        lines.append(ln.strip())
+    return lines
+
+
+def merge_into_sources(sources, name, urls=None, links=None):
+    """把内容并入同名来源（不区分大小写）；没有同名来源就新建。名称为空时总是新建。返回 (来源, 是否并入已有)"""
+    target, merged = None, False
+    if name:
+        for x in sources:
+            if x["name"] and x["name"].lower() == name.lower():
+                target, merged = x, True
+                break
+    if target is None:
+        target = {"id": new_id(sources), "name": name or "", "urls": [], "links": [], "renames": {},
+                  "added": int(time.time())}
+        sources.append(target)
+    for u in urls or []:
+        if u not in target["urls"]:
+            target["urls"].append(u)
+    for l in links or []:
+        if l not in target["links"]:
+            target["links"].append(l)
+    return target, merged
+
+
+def ask_source_name(desc, names):
+    """询问来源名称；可输入编号/已有名称并入已有节点组"""
+    if names:
+        print("   已有节点组: " + "  ".join("%d.%s" % (i, n) for i, n in enumerate(names, 1)))
+        hint = "输入编号或已有名称=并入该节点组；输入新名称=新建；回车=不加前缀；0=放弃这一项"
+    else:
+        hint = "如 US、日本；回车不加前缀；0=放弃这一项"
+    v = ask("   给%s起个名字，用作节点名前缀（%s）: " % (desc, hint))
+    if v == "0":
+        return None
+    if v.isdigit() and 1 <= int(v) <= len(names):
+        v = names[int(v) - 1]
+    else:
+        for n in names:
+            if n.lower() == v.lower():
+                v = n
+                break
+    if v and v in names:
+        print("   ↪ 将并入已有节点组「%s」" % v)
+    return v
+
+
+def known_names(pending=()):
+    names = []
+    for x in load_sources():
+        if x["name"] and x["name"] not in names:
+            names.append(x["name"])
+    for p in pending:
+        if p["name"] and p["name"] not in names:
+            names.append(p["name"])
+    return names
+
+
+def classify_lines(lines):
+    """把粘贴的行分成: 订阅地址 / 节点链接 / 无法识别"""
+    urls, links, unknown = [], [], []
+    for ln in lines:
+        if re.match(r"^https?://", ln, re.I):
+            urls.append(ln)
+        elif "://" in ln:
+            links.append(ln)
+        else:
+            got = [x for x in extract_lines(ln) if "://" in x and not re.match(r"^https?://", x, re.I)]
+            if got:
+                links.extend(got)
+            else:
+                unknown.append(ln)
+    return urls, links, unknown
+
+
+def collect_round(lines, pending, known_urls):
+    """处理一轮粘贴的内容，结果累加到 pending（列表，每项: name/urls/links/count）"""
+    urls, links, unknown = classify_lines(lines)
+    for ln in unknown:
+        print("   无法识别，已忽略: %s" % (ln[:50] + ("…" if len(ln) > 50 else "")))
+    for url in urls:
+        if url in known_urls or any(url in p["urls"] for p in pending):
+            print("ℹ️  这个订阅地址已经添加过，跳过: %s" % url)
+            continue
+        print("==> 拉取并检查: %s" % url)
+        try:
+            nodes, used, skipped = fetch_url_nodes(url)
+        except Exception as e:
+            print("❌ 拉取失败，已跳过: %s" % e)
+            continue
+        print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+        if used != url:
+            print("   （已自动改用更完整的地址: %s）" % used)
+        for ln, why in skipped:
+            print("   跳过: %s  (%s)" % (ln, why))
+        name = ask_source_name("这台 VPS", known_names(pending))
+        if name is None:
+            print("   已放弃这个订阅地址。")
+            continue
+        pending.append({"name": name, "urls": [url], "links": [], "count": len(nodes)})
+    if links:
+        good, skipped, nodes_all = [], [], []
+        for ln in links:
+            n1, s1 = parse_lines([ln])
+            if n1:
+                good.append(ln)
+                nodes_all.extend(n1)
+            else:
+                skipped.extend(s1)
+        for ln, why in skipped:
+            print("   跳过: %s  (%s)" % (ln, why))
+        if good:
+            print("✅ 识别到 %d 个节点: %s" % (len(nodes_all), summarize(nodes_all)))
+            name = ask_source_name("这批节点", known_names(pending))
+            if name is None:
+                print("   已放弃这批节点链接。")
+            else:
+                pending.append({"name": name, "urls": [], "links": good, "count": len(nodes_all)})
+        else:
+            print("❌ 这一轮没有识别到有效的节点链接。")
+
+
+def add_sources():
+    """统一的添加入口: 可混贴订阅地址与节点链接，可多次粘贴，最后生成合并链接。
+    返回 "exit" 表示用户选择退出程序。"""
+    cfg = ensure_cfg()
+    while True:                                   # 外层: 一次「生成」为一个循环
+        pending = []
+        known = {u for x in load_sources() for u in x["urls"]}
+        while True:                               # 内层: 多轮粘贴
+            print(LINE)
+            print("请粘贴【订阅地址】或【节点链接】（可混合、可多行）。")
+            print("粘贴完成后，再按一次回车（空行）结束本轮；输入 0 可返回主菜单。")
+            lines = read_pasted_lines(allow_cancel=True)
+            if lines is None:
+                if not pending:
+                    print("已返回主菜单。")
+                    return None
+                print("（已取消本轮粘贴）")
+            elif lines:
+                collect_round(lines, pending, known)
+            total = sum(p["count"] for p in pending)
+            n_urls = sum(len(p["urls"]) for p in pending)
+            n_batches = sum(1 for p in pending if p["links"])
+            print(LINE)
+            print("📦 已收集: 订阅地址 %d 个、节点链接 %d 批，共 %d 个节点" % (n_urls, n_batches, total))
+            c = ask("  1. 继续粘贴    2. 生成合并链接（直接回车）    0. 放弃本次添加\n请选择 [1/2/0]: ", "2")
+            if c == "1":
+                continue
+            if c == "0":
+                print("❌ 已放弃，本次粘贴的内容没有保存。")
+                return None
+            if total == 0 and not load_sources():
+                print("⚠️  还没有收集到任何有效内容。")
+                c2 = ask("  1. 继续粘贴    0. 放弃\n请选择 [1/0]: ", "1")
+                if c2 == "0":
+                    print("❌ 已放弃。")
+                    return None
+                continue
+            break
+        sources = load_sources()
+        for p in pending:
+            merge_into_sources(sources, p["name"], p["urls"], p["links"])
+        if pending:
+            save_sources(sources)
+        print("==> 正在合并并生成订阅...")
+        if do_refresh() > 0:
+            show_urls(cfg, qr=False)
+            print("💡 需要二维码时，运行 msub 选择「订阅二维码」（或 msub qr）。")
+        c = ask("  1. 继续添加节点    2. 返回主菜单（直接回车）    0. 退出程序\n请选择 [1/2/0]: ", "2")
+        if c == "1":
+            continue
+        if c == "0":
+            return "exit"
+        return "menu"
+
+
+def finish_add(cfg):
+    print("==> 正在合并并生成订阅...")
+    if do_refresh() > 0:
+        show_urls(cfg, qr=False)
+
+
+def add_url(url, name=""):
+    """非交互添加订阅地址（命令行 msub add-url 地址 名称）"""
+    cfg = ensure_cfg()
+    if not re.match(r"^https?://", url or ""):
+        print("❌ 订阅地址必须以 http:// 或 https:// 开头。")
+        return
+    try:
+        nodes, used, skipped = fetch_url_nodes(url)
+    except Exception as e:
+        print("❌ 拉取失败: %s" % e)
+        return
+    print("✅ 解析到 %d 个节点: %s" % (len(nodes), summarize(nodes)))
+    if used != url.strip():
+        print("   （已自动改用更完整的地址: %s）" % used)
+    sources = load_sources()
+    target, merged = merge_into_sources(sources, name or "", urls=[url.strip()])
+    save_sources(sources)
+    if merged:
+        print("↪ 已并入已有节点组「%s」" % target["name"])
+    finish_add(cfg)
+
+
+def add_links(lines, name=""):
+    """非交互添加节点链接（命令行: cat 链接文件 | msub add-links 名称）"""
+    cfg = ensure_cfg()
+    urls, links, unknown = classify_lines(lines)
+    for u in urls:
+        print("ℹ️  检测到订阅地址，请用 msub add-url 添加: %s" % u[:60])
+    good, nodes_all = [], []
+    for ln in links:
+        n1, s1 = parse_lines([ln])
+        if n1:
+            good.append(ln)
+            nodes_all.extend(n1)
+        else:
+            for l2, why in s1:
+                print("   跳过: %s  (%s)" % (l2, why))
+    if not good:
+        print("❌ 没有识别到有效的节点链接。")
+        return
+    print("✅ 识别到 %d 个节点: %s" % (len(nodes_all), summarize(nodes_all)))
+    sources = load_sources()
+    target, merged = merge_into_sources(sources, name or "", links=good)
+    save_sources(sources)
+    if merged:
+        print("↪ 已并入已有节点组「%s」" % target["name"])
+    finish_add(cfg)
+
+
+def qr_menu(cfg):
+    if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+        print("ℹ️  还没有可用订阅，请先添加节点。")
+        return
+    items = url_list(cfg)
+    print(LINE)
+    for i, (t, _, _) in enumerate(items, 1):
+        print("  %d. %s" % (i, t))
+    print("  5. 全部显示")
+    c = ask("请选择要显示二维码的订阅 [1-5，直接回车返回]: ")
+    if c in ("1", "2", "3", "4"):
+        show_urls(cfg, qr=True, only=int(c) - 1)
+    elif c == "5":
+        show_urls(cfg, qr=True)
+
+
+def describe_source(s):
+    parts = []
+    if s["urls"]:
+        parts.append("订阅地址 %d 个" % len(s["urls"]))
+    if s["links"]:
+        parts.append("粘贴节点 %d 条" % len(s["links"]))
+    return " + ".join(parts) or "空"
+
+
+def clean_name(v, maxlen=60):
+    v = (v or "").strip()
+    if not v or len(v) > maxlen or any(ord(ch) < 32 for ch in v):
+        return None
+    return v
+
+
+def all_report_tags():
+    tags = set()
+    for r in read_json(REPORT_FILE, {}).values():
+        tags.update(r.get("tags", []))
+    return tags
+
+
+def rename_source():
+    sources = load_sources()
+    if not sources:
+        print("（还没有添加任何节点组）")
+        return
+    report = read_json(REPORT_FILE, {})
+    print(LINE)
+    for idx, s in enumerate(sources):
+        print("  %d. %s  (%s，节点 %s 个)" % (idx + 1, source_label(s, idx), describe_source(s),
+                                            report.get(s["id"], {}).get("count", "?")))
+    v = ask("请输入要改名的节点组编号（直接回车返回）: ")
+    if not v.isdigit() or not (1 <= int(v) <= len(sources)):
+        return
+    s = sources[int(v) - 1]
+    print("当前名称: %s（作为节点名前缀，例如 %s-Reality-TCP）" % (s.get("name") or "（无）", s.get("name") or "名称"))
+    new = ask("新名称（输入 - 表示不加前缀，直接回车取消）: ")
+    if not new:
+        return
+    if new == "-":
+        new = ""
+    else:
+        new = clean_name(new, 30)
+        if new is None:
+            print("❌ 名称无效（不能为空、不能含换行、最长 30 个字符）。")
+            return
+    if new and any(o is not s and o["name"].lower() == new.lower() for o in sources):
+        print("❌ 已有其他节点组叫这个名字。要合并请在「添加节点」时选择已有节点组。")
+        return
+    s["name"] = new
+    save_sources(sources)
+    do_refresh(verbose=False)
+    print("✅ 节点组名称已改为: %s，订阅已更新。" % (new or "（无前缀）"))
+
+
+def rename_node():
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    flat = []
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        for tag, key in zip(r.get("tags", []), r.get("keys", [])):
+            flat.append((idx, key, tag))
+    if not flat:
+        print("还没有可改名的节点（可先选「立即刷新」）。")
+        return
+    print(LINE)
+    last = -1
+    for i, (idx, key, tag) in enumerate(flat, 1):
+        if idx != last:
+            print("【%s】" % source_label(sources[idx], idx))
+            last = idx
+        mark = "  ✎" if key in sources[idx].get("renames", {}) else ""
+        print("  %3d. %s%s" % (i, tag, mark))
+    v = ask("请输入要改名的节点编号（直接回车返回）: ")
+    if not v.isdigit() or not (1 <= int(v) <= len(flat)):
+        return
+    idx, key, tag = flat[int(v) - 1]
+    new = ask("「%s」的新名称（输入 - 恢复默认名称，直接回车取消）: " % tag)
+    if not new:
+        return
+    s = sources[idx]
+    if new == "-":
+        s.setdefault("renames", {}).pop(key, None)
+    else:
+        name = clean_name(new, 60)
+        if name is None:
+            print("❌ 名称无效（不能为空、不能含换行、最长 60 个字符）。")
+            return
+        if name in RESERVED_TAGS or name in {x["tag"] for x in load_services()}:
+            print("❌ 这个名称是系统保留的分组名，请换一个。")
+            return
+        s.setdefault("renames", {})[key] = name
+    save_sources(sources)
+    do_refresh(verbose=False)
+    nr = read_json(REPORT_FILE, {}).get(s["id"], {})
+    shown = [t for t, k in zip(nr.get("tags", []), nr.get("keys", [])) if k == key]
+    print("✅ 已更新，现在的名称: %s" % (shown[0] if shown else "?"))
+
+
+def manage_menu():
+    while True:
+        print(LINE)
+        print("  节点组与节点管理")
+        print("  1. 查看节点组与节点")
+        print("  2. 修改节点组名称（节点名前缀）")
+        print("  3. 修改节点名称")
+        print("  4. 删除节点组")
+        print("  0. 返回主菜单")
+        print(LINE)
+        c = ask("请选择 [0-4]: ", "0")
+        if c == "1":
+            list_sources()
+        elif c == "2":
+            rename_source()
+        elif c == "3":
+            rename_node()
+        elif c == "4":
+            remove_source()
+        else:
+            return
+
+
+def edit_service():
+    """编辑某个分流服务: 追加/删除域名和 IP 段。返回是否有改动"""
+    sv = load_services()
+    if not sv:
+        print("（没有可编辑的服务）")
+        return False
+    v = ask("请输入要编辑的服务编号: ")
+    if not (v.isdigit() and 1 <= int(v) <= len(sv)):
+        return False
+    x = sv[int(v) - 1]
+    x.setdefault("domains", [])
+    x.setdefault("cidrs", [])
+    changed = False
+    while True:
+        print(LINE)
+        print("  服务: %s" % x["tag"])
+        print("  域名(%d): %s" % (len(x["domains"]), ", ".join(x["domains"]) or "（无）"))
+        print("  IP 段(%d): %s" % (len(x["cidrs"]), ", ".join(x["cidrs"]) or "（无）"))
+        print("  1. 追加域名    2. 追加 IP 段    3. 删除一项（输入域名或 IP 段）    0. 返回")
+        c = ask("请选择: ", "0")
+        if c == "1":
+            good, bad = parse_domains(ask("要追加的域名（逗号或空格分隔，子域名自动包含）: "))
+            for b in bad:
+                print("   忽略无效域名: %s" % b)
+            added = [d for d in good if d not in x["domains"]]
+            x["domains"].extend(added)
+            if added:
+                changed = True
+                print("✅ 已追加: %s" % ", ".join(added))
+        elif c == "2":
+            good, bad = parse_cidrs(ask("要追加的 IP 段（如 1.2.3.0/24，单个 IP 也可以）: "))
+            for b in bad:
+                print("   忽略无效 IP 段: %s" % b)
+            added = [d for d in good if d not in x["cidrs"]]
+            x["cidrs"].extend(added)
+            if added:
+                changed = True
+                print("✅ 已追加: %s" % ", ".join(added))
+        elif c == "3":
+            item = ask("要删除的域名或 IP 段: ").lower()
+            if item in x["domains"]:
+                x["domains"].remove(item)
+                changed = True
+                print("✅ 已删除域名: %s" % item)
+            else:
+                try:
+                    net = str(ipaddress.ip_network(item, strict=False))
+                except ValueError:
+                    net = ""
+                if net and net in x["cidrs"]:
+                    x["cidrs"].remove(net)
+                    changed = True
+                    print("✅ 已删除 IP 段: %s" % net)
+                else:
+                    print("❌ 没有找到这一项。")
+        else:
+            break
+    if changed:
+        save_services(sv)
+    return changed
+
+
+def services_menu():
+    while True:
+        sv = load_services()
+        print(LINE)
+        print("  分流服务（sing-box「大陆直连分流」订阅里，每个服务可单独选择节点）")
+        if not sv:
+            print("  （当前没有任何分流服务）")
+        for i, x in enumerate(sv, 1):
+            extra = "，IP 段 %d 条" % len(x["cidrs"]) if x.get("cidrs") else ""
+            print("  %2d. %-12s 域名 %d 条%s" % (i, x["tag"], len(x.get("domains", [])), extra))
+        print("  e. 编辑服务（追加域名 / IP 段）    a. 添加自定义服务    d. 删除服务    r. 恢复默认    0. 返回")
+        print(LINE)
+        c = ask("请选择: ", "0").lower()
+        changed = False
+        if c == "e":
+            changed = edit_service()
+        elif c == "a":
+            name = clean_name(ask("服务名称（如 OpenAI；直接回车取消）: "), 20)
+            if not name:
+                continue
+            if (name in RESERVED_TAGS or name.startswith("auto-") or name in all_report_tags()
+                    or any(x["tag"].lower() == name.lower() for x in sv)):
+                print("❌ 这个名称已被占用或是保留名称，请换一个。")
+                continue
+            good, bad = parse_domains(ask("域名（逗号或空格分隔，如 openai.com chatgpt.com）: "))
+            for b in bad:
+                print("   忽略无效域名: %s" % b)
+            if not good:
+                print("❌ 没有有效域名。")
+                continue
+            sv.append({"tag": name, "domains": good, "cidrs": []})
+            save_services(sv)
+            changed = True
+        elif c == "d":
+            v = ask("请输入要删除的编号: ")
+            if v.isdigit() and 1 <= int(v) <= len(sv):
+                gone = sv.pop(int(v) - 1)
+                save_services(sv)
+                print("✅ 已删除: %s" % gone["tag"])
+                changed = True
+        elif c == "r":
+            try:
+                os.unlink(SERV_FILE)
+            except Exception:
+                pass
+            print("✅ 已恢复默认分流服务。")
+            changed = True
+        else:
+            return
+        if changed:
+            do_refresh(verbose=False)
+            print("✅ 订阅已更新，请在 sing-box 里更新「大陆直连分流」订阅。")
+
+
+def list_sources():
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    if not sources:
+        print("（还没有添加任何节点组）")
+        return
+    print(LINE)
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        print("[%d] %s  (%s)  节点 %s 个  状态: %s" % (idx + 1, source_label(s, idx), describe_source(s),
+                                                      r.get("count", "?"), r.get("status", "未刷新")))
+        for u in s["urls"]:
+            print("    %s" % u)
+        for t in r.get("tags", []):
+            print("      - %s" % t)
+    print(LINE)
+
+
+def remove_source(arg=None):
+    sources = load_sources()
+    if not sources:
+        print("（还没有添加任何节点组）")
+        return
+    list_sources()
+    v = arg if arg else input("请输入要删除的节点组编号（0 取消）: ").strip()
+    if not v.isdigit() or int(v) == 0 or int(v) > len(sources):
+        print("❌ 已取消。")
+        return
+    s = sources.pop(int(v) - 1)
+    save_sources(sources)
+    delete_source_cache(s)
+    print("✅ 已删除节点组: %s" % source_label(s, int(v) - 1))
+    do_refresh()
+
+
+# ============================================================
+#  设置 / 状态 / 升级 / 卸载
+# ============================================================
+
+def settings():
+    cfg = ensure_cfg()
+    print(LINE)
+    print("  1. 修改订阅服务端口（当前 %s）" % cfg["port"])
+    print("  2. 修改自动刷新间隔（当前 %s 小时）" % cfg.get("interval_hours", 3))
+    print("  3. 更换订阅 token（所有订阅链接都会变化）")
+    print("  4. 修改服务器 IP（当前 %s）" % cfg.get("ip"))
+    print("  5. 分流服务（Telegram / YouTube / Claude 等，用于 sing-box 分流订阅）")
+    print("  0. 返回")
+    print(LINE)
+    c = input("请选择 [0-5]: ").strip()
+    if c == "1":
+        v = input("新端口: ").strip()
+        if not v.isdigit() or not (1 <= int(v) <= 65535):
+            print("❌ 端口无效。")
+            return
+        if int(v) == int(cfg["port"]):
+            print("❌ 与当前端口相同。")
+            return
+        if not port_free(int(v)):
+            print("❌ 端口已被占用。")
+            return
+        old = int(cfg["port"])
+        cfg["port"] = int(v)
+        save_cfg(cfg)
+        sc("restart", "msub-web")
+        open_firewall(int(v))
+        close_firewall(old)
+        do_refresh(verbose=False)
+        print("✅ 端口已改为 %s，订阅链接已变化，请在云安全组放行新端口。" % v)
+        show_urls(cfg)
+    elif c == "2":
+        v = input("刷新间隔（小时，1-168）: ").strip()
+        if not v.isdigit() or not (1 <= int(v) <= 168):
+            print("❌ 无效。")
+            return
+        cfg["interval_hours"] = int(v)
+        save_cfg(cfg)
+        write_units(cfg)
+        sc("restart", "msub-refresh.timer")
+        print("✅ 已改为每 %s 小时自动刷新。" % v)
+    elif c == "3":
+        cfg["token"] = os.urandom(8).hex()
+        save_cfg(cfg)
+        print("✅ token 已更换，旧订阅链接全部失效，请使用新的链接。")
+        show_urls(cfg)
+    elif c == "4":
+        v = input("新的服务器 IP: ").strip()
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+            print("❌ IP 格式不对。")
+            return
+        cfg["ip"] = v
+        save_cfg(cfg)
+        do_refresh(verbose=False)
+        print("✅ 已更新。")
+    elif c == "5":
+        services_menu()
+
+
+def http_code(url):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return "无法连接(%s)" % e
+
+
+def status():
+    cfg = load_cfg()
+    print(LINE)
+    for u in ("msub-web", "msub-refresh.timer"):
+        r = sc("is-active", u)
+        print("服务 %-20s %s" % (u, r.stdout.strip() if r else "（无 systemctl）"))
+    if cfg:
+        b = "http://127.0.0.1:%s/%s" % (cfg.get("port"), cfg.get("token"))
+        for p in ("sub", "clash", "singbox", "singbox-cn"):
+            print("本机访问 /%-10s -> HTTP %s" % (p, http_code("%s/%s" % (b, p))))
+    web = cfg.get("web") or {}
+    print("网页管理: %s" % (web_url(cfg) if web.get("enabled") and web.get("hash") else "未开启"))
+    sources = load_sources()
+    report = read_json(REPORT_FILE, {})
+    print("节点组数量: %d" % len(sources))
+    for idx, s in enumerate(sources):
+        r = report.get(s["id"], {})
+        print("  [%d] %s: %s，节点 %s" % (idx + 1, source_label(s, idx), r.get("status", "未刷新"), r.get("count", "?")))
+    print(LINE)
+    if shutil.which("journalctl"):
+        r = run(["journalctl", "-u", "msub-web", "-n", "8", "--no-pager"])
+        if r:
+            print(r.stdout)
+
+
+def script_version_of(text):
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
+
+
+def changelog_newer(text, local):
+    m = re.search(r"# CHANGELOG-BEGIN\n(.*?)# CHANGELOG-END", text, re.S)
+    out = []
+    if m:
+        for ln in m.group(1).splitlines():
+            mm = re.match(r"# (\d[\w.\-]*)\s+(.*)", ln)
+            if mm and ver_tuple(mm.group(1)) > ver_tuple(local):
+                out.append("   %s  %s" % (mm.group(1), mm.group(2)))
+    return out
+
+
+def upgrade(assume_yes=False, check_only=False):
+    print("当前脚本版本: %s" % VERSION)
+    try:
+        text = http_get(SCRIPT_URL)
+    except Exception as e:
+        print("❌ 下载失败: %s\n   %s" % (SCRIPT_URL, e))
+        return
+    rv = script_version_of(text)
+    if not rv:
+        print("❌ 远程文件里没有版本号，可能地址不对，已放弃。")
+        return
+    try:
+        compile(text, "msub", "exec")
+    except SyntaxError as e:
+        print("❌ 远程脚本语法检查未通过，已放弃: %s" % e)
+        return
+    print("远程最新版本: %s" % rv)
+    newer = ver_tuple(rv) > ver_tuple(VERSION)
+    if newer:
+        print("🆕 更新内容:")
+        for l in changelog_newer(text, VERSION):
+            print(l)
+    else:
+        print("✅ 已经是最新版本。")
+    if check_only:
+        return
+    if not assume_yes:
+        ans = input("确定升级吗？(Y/n): " if newer else "仍要强制重新安装吗？(y/N): ").strip().lower()
+        if newer and ans.startswith("n"):
+            print("❌ 已取消。")
+            return
+        if not newer and not ans.startswith("y"):
+            return
+    need_root()
+    write_atomic(BIN_PATH, text, 0o755)
+    print("✅ 已更新到 %s，正在应用..." % rv)
+    py = sys.executable or "/usr/bin/python3"
+    os.execv(py, [py, BIN_PATH, "post-upgrade"])
+
+
+def post_upgrade():
+    cfg = load_cfg()
+    if cfg:
+        write_units(cfg)
+        sc("restart", "msub-web")
+        sc("restart", "msub-refresh.timer")
+        do_refresh()
+        print("✅ 升级完成。")
+
+
+def uninstall():
+    print(LINE)
+    print("⚠️  将删除订阅服务、所有节点组与生成的订阅文件（不影响其他 VPS 和你的节点）。")
+    if input("确定要卸载吗？(y/N): ").strip().lower() not in ("y", "yes"):
+        print("❌ 操作已取消。")
+        return
+    need_root()
+    cfg = load_cfg()
+    for u in ("msub-web", "msub-refresh.timer"):
+        sc("stop", u)
+        sc("disable", u)
+    for f in (WEB_UNIT, REFRESH_UNIT, TIMER_UNIT):
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+    sc("daemon-reload")
+    if cfg.get("port"):
+        close_firewall(int(cfg["port"]))
+    shutil.rmtree(BASE, ignore_errors=True)
+    try:
+        os.unlink(BIN_PATH)
+    except Exception:
+        pass
+    print("✅ 卸载完成。")
+    sys.exit(0)
+
+
+# ============================================================
+#  菜单 / 入口
+# ============================================================
+
+def menu():
+    cfg = ensure_cfg()
+    while True:
+        print(LINE)
+        print("      msub 订阅合并工具  v%s" % VERSION)
+        print(LINE)
+        print("  1. 添加节点（粘贴订阅地址 / 节点链接，可混合、可多次）")
+        print("  2. 节点组与节点管理（查看 / 改名 / 删除）")
+        print("  3. 查看合并订阅链接")
+        print("  4. 订阅二维码")
+        print("  5. 立即刷新")
+        print("  6. 网页管理界面（手机 / 电脑浏览器管理）")
+        print("  7. 设置（端口 / 刷新间隔 / token / IP / 分流服务）")
+        print("  8. 状态检测")
+        print("  9. 检查并升级本脚本")
+        print(" 10. 卸载")
+        print("  0. 退出")
+        print(LINE)
+        print(" 💡 快捷命令: 输入 msub 即可打开本菜单")
+        print("    直达: msub add | manage | show | qr | web | refresh | status | upgrade")
+        print(LINE)
+        try:
+            c = input("请输入数字选择 [0-10]: ").strip()
+        except EOFError:
+            return
+        cfg = load_cfg()
+        if c == "1":
+            if add_sources() == "exit":
+                return
+        elif c == "2":
+            manage_menu()
+        elif c == "3":
+            if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+                print("ℹ️  还没有可用订阅，请先添加节点。")
+            else:
+                show_urls(cfg, qr=False)
+        elif c == "4":
+            qr_menu(cfg)
+        elif c == "5":
+            do_refresh()
+        elif c == "6":
+            web_menu()
+        elif c == "7":
+            settings()
+        elif c == "8":
+            status()
+        elif c == "9":
+            upgrade()
+        elif c == "10":
+            uninstall()
+        elif c == "0":
+            return
+        else:
+            print("❌ 无效输入。")
+        print("")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    rest = argv[2:]
+    if cmd == "version":
+        print(VERSION)
+        return
+    if cmd == "serve":
+        do_serve()
+        return
+    if cmd in ("", "menu"):
+        need_root()
+        menu()
+        return
+    need_root()
+    if cmd == "show":
+        cfg = ensure_cfg()
+        show_urls(cfg, qr=("qr" in rest))
+    elif cmd == "qr":
+        cfg = ensure_cfg()
+        if not os.path.exists(OUT_DIR + "/sub_b64.txt"):
+            print("ℹ️  还没有可用订阅，请先添加节点。")
+        elif rest and rest[0] in ("1", "2", "3", "4"):
+            show_urls(cfg, qr=True, only=int(rest[0]) - 1)
+        elif rest and rest[0] == "all":
+            show_urls(cfg, qr=True)
+        else:
+            qr_menu(cfg)
+    elif cmd == "add":
+        if add_sources() == "menu":
+            menu()
+    elif cmd == "manage":
+        manage_menu()
+    elif cmd == "web":
+        web_menu()
+    elif cmd == "add-url":
+        add_url(rest[0] if rest else "", rest[1] if len(rest) > 1 else "")
+    elif cmd == "add-links":
+        add_links([l.strip() for l in sys.stdin.read().splitlines() if l.strip()], rest[0] if rest else "")
+    elif cmd == "list":
+        list_sources()
+    elif cmd == "remove":
+        remove_source(rest[0] if rest else None)
+    elif cmd == "refresh":
+        do_refresh(verbose="--quiet" not in rest)
+    elif cmd == "status":
+        status()
+    elif cmd == "upgrade":
+        upgrade(assume_yes="-y" in rest)
+    elif cmd == "check":
+        upgrade(check_only=True)
+    elif cmd == "post-upgrade":
+        post_upgrade()
+    elif cmd == "uninstall":
+        uninstall()
+    elif cmd == "setup":
+        setup()
+    else:
+        print("未知命令: %s" % cmd)
+        print("可用: add | manage | web | show | qr [1-4|all] | add-url 地址 [名称] | add-links [名称] | list | remove [编号] | refresh | status | upgrade [-y] | check | version | uninstall")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except KeyboardInterrupt:
+        print("\n已取消。")
