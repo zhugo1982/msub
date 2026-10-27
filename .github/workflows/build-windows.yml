@@ -4,7 +4,7 @@ on:
   workflow_dispatch:          # 在仓库的 Actions 页面手动点「Run workflow」
   push:
     tags:
-      - "v*"                  # 推送形如 v1.5.0 的标签时自动打包并发布到 Releases
+      - "v*"                  # 推送形如 v1.6.0 的标签时自动打包并发布到 Releases
 
 permissions:
   contents: write
@@ -21,6 +21,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: 安装打包工具
+        shell: pwsh
+        run: python -m pip install --upgrade pip pyinstaller segno pystray pillow
+
       - name: 准备入口脚本并读取版本号
         shell: pwsh
         run: |
@@ -33,21 +37,48 @@ jobs:
           "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "版本号: $ver"
 
-      - name: 安装打包工具
+      - name: 生成程序图标
         shell: pwsh
-        run: python -m pip install --upgrade pip pyinstaller segno
+        env:
+          MSUB_HOME: ${{ runner.temp }}\msub-icon
+        run: |
+          python -c "import build_entry as m; m.make_tray_image(256).save('msub.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(256,256)])"
+          if (-not (Test-Path msub.ico)) { throw "图标生成失败" }
 
       - name: 打包
         shell: pwsh
-        run: pyinstaller --noconfirm --clean --console --name msub --collect-all segno build_entry.py
+        run: |
+          Copy-Item windows/msub.spec msub.spec
+          pyinstaller --noconfirm --clean msub.spec
 
-      - name: 自检（启动服务、登录、添加节点、读取各种订阅）
+      - name: 自检（控制台版：启动服务、登录、添加节点、读取各种订阅、检查托盘组件）
         shell: pwsh
         env:
           MSUB_HOME: ${{ runner.temp }}\msub-selftest
         run: |
-          & ./dist/msub/msub.exe selftest
+          & ./dist/msub/msub-console.exe selftest
           if ($LASTEXITCODE -ne 0) { throw "打包后的程序自检失败，请查看上面的输出" }
+
+      - name: 冒烟测试（窗口版 msub.exe 能启动并提供管理页面）
+        shell: pwsh
+        env:
+          MSUB_HOME: ${{ runner.temp }}\msub-smoke
+          MSUB_NO_WINDOW: "1"
+        run: |
+          $p = Start-Process -FilePath ./dist/msub/msub.exe -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $cfg = Get-Content "$env:MSUB_HOME\config.json" -Raw | ConvertFrom-Json
+              $r = Invoke-WebRequest -UseBasicParsing -Uri ("http://127.0.0.1:{0}/admin" -f $cfg.web.port) -TimeoutSec 3
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            if ($p.HasExited) { break }
+          }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          if (Test-Path "$env:MSUB_HOME\msub.log") { Write-Host "---- msub.log ----"; Get-Content "$env:MSUB_HOME\msub.log" }
+          if (-not $ok) { throw "窗口版 msub.exe 没有在预期时间内提供管理页面，请查看上面的日志" }
 
       - name: 生成压缩包
         shell: pwsh
