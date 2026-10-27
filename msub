@@ -30,6 +30,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import traceback
 import threading
 import time
 import urllib.error
@@ -37,9 +38,10 @@ import webbrowser
 import urllib.parse
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.6.0  Windows 绿色版：系统托盘图标 + 独立窗口（Edge/Chrome 应用模式），无黑色窗口；首次设置密码改在窗口里完成；新增开机自启、数据文件夹入口
 # 1.5.0  新增便携模式（Windows 绿色版）：双击运行、数据保存在程序旁的 data 文件夹、自动打开网页管理；新增 selftest 自检命令
 # 1.4.0  新增网页管理界面（手机/电脑浏览器管理节点、查看订阅链接和二维码），默认关闭，需设置密码，独立端口，默认 HTTPS；主菜单新增「网页管理界面」（原 6-10 项顺延）
 # 1.3.2  添加节点时可输入 0 返回主菜单或放弃当前项；分流服务支持编辑（追加/删除域名和 IP 段）
@@ -1319,6 +1321,7 @@ SESS_LOCK = threading.Lock()
 SESSIONS = {}
 FAILS = {}
 SESSION_TTL = 12 * 3600
+SETUP_TOKEN = None      # 首次设置密码用的一次性令牌（只存在内存里，只有启动器打开的窗口才知道）
 MAX_FAILS = 5
 LOCK_SECONDS = 600
 MAX_BODY = 2 * 1024 * 1024
@@ -1672,6 +1675,12 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
     def _is_tls(self):
         return isinstance(self.request, ssl.SSLSocket)
 
+    def _host_ok(self):
+        if load_cfg().get("bind") != "127.0.0.1":
+            return True
+        host = urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname or ""
+        return host in ("127.0.0.1", "localhost", "::1")
+
     def _origin_ok(self):
         origin = self.headers.get("Origin")
         if not origin:
@@ -1696,6 +1705,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
 
     # ---- GET ----
     def do_GET(self):
+        if not self._host_ok():
+            return self._json(403, {"error": "不允许的访问地址"})
         u = urllib.parse.urlsplit(self.path)
         path, query = u.path, urllib.parse.parse_qs(u.query)
         if path == "/":
@@ -1731,7 +1742,7 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
     # ---- POST ----
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
-        if not self._origin_ok():
+        if not self._host_ok() or not self._origin_ok():
             return self._json(403, {"error": "请求来源不合法"})
         try:
             body = self._read_json()
@@ -1739,6 +1750,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         if path == "/admin/api/login":
             return self._login(body)
+        if path == "/admin/api/setup":
+            return self._setup(body)
         sid = self._sid()
         s = get_session(sid)
         if not s:
@@ -1774,6 +1787,35 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         login_fail(ip)
         time.sleep(0.8)
         return self._json(401, {"error": "密码错误"})
+
+    def _setup(self, body):
+        """首次设置密码：需要启动器给出的一次性令牌，且当前还没有设置过密码"""
+        global SETUP_TOKEN
+        ip = self.client_address[0]
+        wait = login_locked(ip)
+        if wait:
+            return self._json(429, {"error": "尝试次数过多，请 %d 分钟后再试" % (wait // 60 + 1)})
+        cfg = load_cfg()
+        web = cfg.get("web") or {}
+        tok = SETUP_TOKEN
+        if not tok or web.get("hash"):
+            return self._json(403, {"error": "已经设置过密码，请直接登录"})
+        if not hmac.compare_digest(str(body.get("token", "")).encode("utf-8", "ignore"), tok.encode("utf-8")):
+            login_fail(ip)
+            return self._json(403, {"error": "安全校验失败，请从托盘图标重新打开窗口"})
+        pw = str(body.get("password", ""))
+        if len(pw) < 8:
+            return self._json(400, {"error": "密码至少 8 位"})
+        web.update(hash_password(pw))
+        web["enabled"] = True
+        cfg["web"] = web
+        save_cfg(cfg)
+        SETUP_TOKEN = None
+        login_ok(ip)
+        sid, csrf = new_session(ip)
+        cookie = "msub_sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (
+            sid, SESSION_TTL, "; Secure" if self._is_tls() else "")
+        return self._json(200, {"ok": True, "csrf": csrf}, headers={"Set-Cookie": cookie})
 
     def _dispatch(self, path, b, sid):
         if not path.startswith("/admin/api/"):
@@ -1999,6 +2041,15 @@ details summary{cursor:pointer;margin:8px 0}
 </style>
 </head>
 <body>
+<div id="setup" class="card narrow" hidden>
+  <h2>首次使用：设置登录密码</h2>
+  <p class="muted">这个密码用来登录 msub 的管理页面，至少 8 位。</p>
+  <input id="setupPw" type="password" placeholder="设置密码（至少 8 位）" autocomplete="new-password">
+  <div class="row"><input id="setupPw2" type="password" placeholder="再输入一次" autocomplete="new-password"></div>
+  <div class="row"><button id="setupBtn">设置并进入</button></div>
+  <p id="setupErr" class="err"></p>
+</div>
+
 <div id="login" class="card narrow" hidden>
   <h2>msub 管理登录</h2>
   <input id="pw" type="password" placeholder="登录密码" autocomplete="current-password">
@@ -2066,6 +2117,7 @@ details summary{cursor:pointer;margin:8px 0}
   var state = null;
   var pendingItems = [];
   var toastTimer = null;
+  var setupToken = "";
 
   function $(id) { return document.getElementById(id); }
   function clear(n) { while (n.firstChild) { n.removeChild(n.firstChild); } }
@@ -2106,14 +2158,32 @@ details summary{cursor:pointer;margin:8px 0}
       return r.json().then(function (j) { return { r: r, j: j }; },
         function () { return { r: r, j: { error: "服务器返回了无法识别的内容" } }; });
     }).then(function (x) {
-      if (x.r.status === 401 && path !== "login") { showLogin(); throw new Error("登录已过期，请重新登录"); }
+      if (x.r.status === 401 && path !== "login" && path !== "setup") { showLogin(); throw new Error("登录已过期，请重新登录"); }
       if (!x.r.ok || x.j.error) { throw new Error(x.j.error || ("请求失败 " + x.r.status)); }
       return x.j;
     });
   }
 
-  function showLogin() { $("app").hidden = true; $("login").hidden = false; $("pw").value = ""; }
-  function showApp() { $("login").hidden = true; $("app").hidden = false; return loadState(); }
+  function showLogin() { $("app").hidden = true; $("setup").hidden = true; $("login").hidden = false; $("pw").value = ""; }
+  function showSetup() { $("app").hidden = true; $("login").hidden = true; $("setup").hidden = false; }
+  function showApp() { $("login").hidden = true; $("setup").hidden = true; $("app").hidden = false; return loadState(); }
+  function parseSetup() {
+    var h = (window.location && window.location.hash) || "";
+    if (h.indexOf("#setup=") === 0) { setupToken = h.slice(7); }
+  }
+  function doSetup() {
+    var a = $("setupPw").value;
+    var b = $("setupPw2").value;
+    if (a.length < 8) { $("setupErr").textContent = "密码至少 8 位"; return; }
+    if (a !== b) { $("setupErr").textContent = "两次输入不一致"; return; }
+    api("POST", "setup", { token: setupToken, password: a }).then(function (j) {
+      csrf = j.csrf;
+      setupToken = "";
+      $("setupErr").textContent = "";
+      if (typeof history !== "undefined" && history.replaceState) { history.replaceState(null, "", "/admin"); }
+      return showApp();
+    }).catch(function (e) { $("setupErr").textContent = e.message; });
+  }
   function loadState() {
     return api("GET", "state").then(function (j) { state = j; renderAll(); }).catch(fail);
   }
@@ -2335,6 +2405,7 @@ details summary{cursor:pointer;margin:8px 0}
   }
 
   function bind() {
+    $("setupBtn").addEventListener("click", doSetup);
     $("loginBtn").addEventListener("click", doLogin);
     $("pw").addEventListener("keydown", function (e) { if (e.key === "Enter") { doLogin(); } });
     $("logoutBtn").addEventListener("click", function () {
@@ -2375,11 +2446,12 @@ details summary{cursor:pointer;margin:8px 0}
 
   function start() {
     bind();
+    parseSetup();
     api("GET", "session").then(function (j) {
       if (j.authed) { csrf = j.csrf; return showApp(); }
-      showLogin();
+      if (setupToken) { showSetup(); } else { showLogin(); }
       return null;
-    }).catch(function () { showLogin(); });
+    }).catch(function () { if (setupToken) { showSetup(); } else { showLogin(); } });
   }
   start();
 })();
@@ -3397,6 +3469,8 @@ def fix_console():
         except Exception:
             pass
     for st in (sys.stdout, sys.stderr):
+        if st is None:
+            continue
         try:
             st.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
@@ -3421,7 +3495,7 @@ def pick_free_port(start, avoid=()):
     return start
 
 
-def portable_setup(interactive=True, password=None):
+def portable_setup(interactive=True, password=None, allow_no_password=False):
     for d in (BASE, CACHE_DIR, OUT_DIR):
         os.makedirs(d, exist_ok=True)
     cfg = load_cfg()
@@ -3436,7 +3510,7 @@ def portable_setup(interactive=True, password=None):
         web["port"] = pick_free_port(DEFAULT_WEB_PORT, avoid=(cfg["port"],))
     web["https"] = False
     web["enabled"] = True
-    if not web.get("hash"):
+    if not web.get("hash") and not allow_no_password:
         pw = password
         if pw is None:
             if not interactive:
@@ -3543,6 +3617,222 @@ def run_portable():
     print("已退出。")
 
 
+# ---------- 托盘图标 + 独立窗口（Windows 图形界面模式）----------
+
+def is_gui_mode():
+    """窗口模式(msub.exe)没有控制台，sys.stdout 为 None；MSUB_GUI=1/0 可强制开关（测试用）"""
+    flag = os.environ.get("MSUB_GUI")
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    return bool(getattr(sys, "frozen", False)) and sys.platform == "win32" and sys.stdout is None
+
+
+def make_tray_image(size=64):
+    """程序化绘制托盘/程序图标：蓝色圆角方块，三条线汇合到一个点（象征合并）"""
+    from PIL import Image, ImageDraw
+    sz = int(size)
+    img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, sz - 1, sz - 1], radius=max(2, sz // 5), fill=(37, 99, 235, 255))
+    white = (255, 255, 255, 255)
+    w = max(2, sz // 12)
+    cx, cy = int(sz * 0.74), int(sz * 0.5)
+    for fy in (0.28, 0.5, 0.72):
+        y = int(sz * fy)
+        d.line([(int(sz * 0.18), y), (int(sz * 0.5), y)], fill=white, width=w)
+        d.line([(int(sz * 0.5), y), (cx, cy)], fill=white, width=w)
+    r = max(2, sz // 9)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=white)
+    return img
+
+
+def find_app_browser():
+    """找电脑上的 Edge / Chrome，用来打开独立的应用窗口"""
+    names = (("Microsoft", "Edge", "Application", "msedge.exe"),
+             ("Google", "Chrome", "Application", "chrome.exe"))
+    for env in ("ProgramFiles(x86)", "ProgramFiles", "LocalAppData"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        for parts in names:
+            path = os.path.join(base, *parts)
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def open_app_window(url):
+    """用 Edge/Chrome 的「应用模式」打开一个没有地址栏的独立窗口；找不到就退回默认浏览器"""
+    if os.environ.get("MSUB_NO_WINDOW"):
+        return False
+    exe = find_app_browser()
+    if exe:
+        try:
+            subprocess.Popen([exe, "--app=" + url, "--user-data-dir=" + os.path.join(BASE, "window-profile"),
+                              "--window-size=1040,780", "--no-first-run", "--no-default-browser-check"])
+            return True
+        except Exception:
+            pass
+    try:
+        return webbrowser.open(url)
+    except Exception:
+        return False
+
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def get_autostart():
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            winreg.QueryValueEx(k, "msub")
+        return True
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if on:
+                winreg.SetValueEx(k, "msub", 0, winreg.REG_SZ, '"%s" --tray' % sys.executable)
+            else:
+                try:
+                    winreg.DeleteValue(k, "msub")
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+
+def copy_to_clipboard(text):
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["clip"], input=text.encode("ascii", "ignore"),
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=10)
+            return True
+        if shutil.which("xclip"):
+            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), timeout=10)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def open_folder(path):
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", path])
+        else:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def locked_refresh():
+    with WEB_LOCK:
+        return do_refresh(verbose=False)
+
+
+def run_tray(cfg, admin_url):
+    """显示托盘图标并阻塞直到用户选择退出。返回 False 表示托盘不可用。"""
+    try:
+        import pystray
+        image = make_tray_image(64)
+    except Exception as e:
+        print("托盘图标不可用: %r" % (e,))
+        return False
+
+    def current_url():
+        return admin_url + ("#setup=" + SETUP_TOKEN if SETUP_TOKEN else "")
+
+    def on_open(icon=None, item=None):
+        open_app_window(current_url())
+
+    def on_browser(icon=None, item=None):
+        try:
+            webbrowser.open(current_url())
+        except Exception:
+            pass
+
+    def on_copy(icon=None, item=None):
+        copy_to_clipboard(url_list(load_cfg())[0][1])
+
+    def on_refresh(icon=None, item=None):
+        threading.Thread(target=locked_refresh, daemon=True).start()
+
+    def on_folder(icon=None, item=None):
+        open_folder(BASE)
+
+    def on_autostart(icon=None, item=None):
+        set_autostart(not get_autostart())
+
+    def on_quit(icon=None, item=None):
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("打开窗口", on_open, default=True),
+        pystray.MenuItem("在浏览器中打开", on_browser),
+        pystray.MenuItem("复制订阅链接（通用）", on_copy),
+        pystray.MenuItem("立即刷新", on_refresh),
+        pystray.MenuItem("打开数据文件夹", on_folder),
+        pystray.MenuItem("开机自启", on_autostart, checked=lambda item: get_autostart()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("退出", on_quit),
+    )
+    try:
+        icon = pystray.Icon("msub", image, "msub 订阅合并工具", menu)
+        icon.run()
+    except Exception:
+        print("托盘图标运行失败:\n" + traceback.format_exc())
+        return False
+    return True
+
+
+def run_gui(background=False):
+    """图形界面模式：没有黑色窗口；托盘图标 + Edge/Chrome 应用窗口；日志写入数据文件夹"""
+    global SETUP_TOKEN
+    try:
+        os.makedirs(BASE, exist_ok=True)
+        lf = open(os.path.join(BASE, "msub.log"), "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = lf
+    except Exception:
+        pass
+    print("---- %s 启动 v%s ----" % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION))
+    cfg = portable_setup(interactive=False, allow_no_password=True)
+    web = cfg["web"]
+    admin_url = "http://127.0.0.1:%s/admin" % web["port"]
+    need_setup = not web.get("hash")
+    try:
+        start_portable_servers(cfg)
+    except OSError:
+        print("端口已被占用，msub 可能已经在运行，直接打开已有窗口。")
+        open_app_window(admin_url)
+        return
+    if need_setup:
+        SETUP_TOKEN = secrets.token_urlsafe(16)
+    threading.Thread(target=portable_refresher, daemon=True).start()
+    if not background or need_setup:
+        open_app_window(admin_url + ("#setup=" + SETUP_TOKEN if SETUP_TOKEN else ""))
+    if not run_tray(cfg, admin_url):
+        print("没有托盘图标，程序将在后台保持运行（可在任务管理器里结束 msub.exe）。")
+        while True:
+            time.sleep(3600)
+    print("已退出。")
+
+
 def selftest():
     """打包后的自检：启动服务、登录、添加节点、读取各种订阅。用于 CI 确认 exe 能正常工作。"""
     fix_console()
@@ -3592,8 +3882,16 @@ def selftest():
         svg = qr_svg("selftest")
         if getattr(sys, "frozen", False):
             check("二维码生成可用", svg is not None and "<svg" in svg)
+            try:
+                import pystray
+                if sys.platform == "win32":
+                    import pystray._win32
+                img = make_tray_image(64)
+                check("托盘图标组件可用 (pystray + Pillow)", img.size == (64, 64))
+            except Exception as e:
+                check("托盘图标组件可用: %r" % (e,), False)
         else:
-            print("SKIP 二维码（非打包环境）")
+            print("SKIP 二维码 / 托盘组件（非打包环境）")
         check("TLS 证书库可用", ssl.create_default_context() is not None)
     except Exception as e:
         check("自检过程出现异常: %r" % (e,), False)
@@ -3606,6 +3904,9 @@ def selftest():
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     rest = argv[2:]
+    background = "--tray" in argv[1:]
+    if cmd == "--tray":
+        cmd = ""
     if cmd == "version":
         print(VERSION)
         return
@@ -3616,7 +3917,13 @@ def main(argv):
         selftest()
         return
     if cmd == "" and PORTABLE:
-        run_portable()
+        if is_gui_mode():
+            try:
+                run_gui(background)
+            except Exception:
+                traceback.print_exc()
+        else:
+            run_portable()
         return
     if cmd in ("", "menu"):
         need_root()
