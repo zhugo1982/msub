@@ -38,9 +38,10 @@ import webbrowser
 import urllib.parse
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 # 更新日志（每次发布新版本时，在下面最上方追加一行，格式: # 版本号  更新内容）
 # CHANGELOG-BEGIN
+# 1.7.0  网页管理：节点列表里每个节点新增「链接」「二维码」按钮（单个节点分享链接，适用于 NekoBox / v2rayNG 等扫码导入）；ShadowTLS 等无标准链接的节点会说明原因
 # 1.6.0  Windows 绿色版：系统托盘图标 + 独立窗口（Edge/Chrome 应用模式），无黑色窗口；首次设置密码改在窗口里完成；新增开机自启、数据文件夹入口
 # 1.5.0  新增便携模式（Windows 绿色版）：双击运行、数据保存在程序旁的 data 文件夹、自动打开网页管理；新增 selftest 自检命令
 # 1.4.0  新增网页管理界面（手机/电脑浏览器管理节点、查看订阅链接和二维码），默认关闭，需设置密码，独立端口，默认 HTTPS；主菜单新增「网页管理界面」（原 6-10 项顺延）
@@ -392,6 +393,8 @@ def _tls_from_qs(qs, default_enabled=True):
 
 def _transport_from_qs(qs):
     t = _q(qs, "type", "tcp").lower()
+    if t in ("tcp", ""):
+        return None
     if t == "grpc":
         return {"type": "grpc", "service_name": _q(qs, "serviceName")}
     if t == "ws":
@@ -400,7 +403,8 @@ def _transport_from_qs(qs):
         if host:
             tr["headers"] = {"Host": host}
         return tr
-    return None
+    # 其他传输方式(httpupgrade / xhttp / kcp / quic / h2 ...)不能悄悄丢掉，否则会导入成连不上的坏节点
+    raise ValueError("暂不支持的传输方式: %s" % t)
 
 
 def _hostport(u, default_port):
@@ -457,6 +461,8 @@ def p_vmess(line):
             tls["alpn"] = [a for a in str(j["alpn"]).split(",") if a]
         out["tls"] = tls
     net = (j.get("net") or "tcp").lower()
+    if net not in ("tcp", "ws", "grpc"):
+        raise ValueError("暂不支持的传输方式: %s" % net)
     if net == "ws":
         tr = {"type": "ws", "path": j.get("path") or "/"}
         if j.get("host"):
@@ -1221,6 +1227,7 @@ def collect_nodes():
             if k in seen_keys:
                 continue
             seen_keys.add(k)
+            n["key"] = k
             retag(n, s.get("name", ""), seen_tags, override=renames.get(k))
             n["source"] = label
             kept.append(n)
@@ -1232,9 +1239,26 @@ def collect_nodes():
     return allnodes, report
 
 
+def build_node_links(nodes):
+    """每个节点的单独分享链接，供网页里「链接 / 二维码」按钮使用（含凭证，文件权限 600，不对外提供）"""
+    out = {}
+    for n in nodes:
+        key = n.get("key")
+        if not key:
+            continue
+        link = safe_convert(to_link, n)
+        item = {"tag": n["out"]["tag"], "link": link}
+        if not link:
+            item["reason"] = ("ShadowTLS 节点没有标准的分享链接格式，请使用 sing-box / Clash 订阅"
+                              if n["helpers"] else "这个节点使用的传输方式没有标准的分享链接格式")
+        out[kid_of(key)] = item
+    return out
+
+
 def render_outputs(nodes, cfg):
     links = [l for l in (safe_convert(to_link, n) for n in nodes) if l]
     os.makedirs(OUT_DIR, exist_ok=True)
+    write_json(OUT_DIR + "/node_links.json", build_node_links(nodes))
     write_atomic(OUT_DIR + "/sub_b64.txt", b64e("\n".join(links).encode("utf-8")))
     write_atomic(OUT_DIR + "/clash.yaml", build_clash(nodes, cfg))
     write_atomic(OUT_DIR + "/singbox.json", build_singbox(nodes, cfg, cn=False))
@@ -1254,7 +1278,7 @@ def do_refresh(verbose=True):
             print("  [%s] %s: %s，节点 %d 个" % (idx + 1, source_label(s, idx), r.get("status"), r.get("count", 0)))
     if not nodes:
         if not load_sources():
-            for fn in ("sub_b64.txt", "clash.yaml", "singbox.json", "singbox-cn.json"):
+            for fn in ("sub_b64.txt", "clash.yaml", "singbox.json", "singbox-cn.json", "node_links.json"):
                 try:
                     os.unlink(os.path.join(OUT_DIR, fn))
                 except Exception:
@@ -1424,10 +1448,12 @@ def web_state():
     cfg = load_cfg()
     sources = load_sources()
     report = read_json(REPORT_FILE, {})
+    node_links = read_json(OUT_DIR + "/node_links.json", {})
     groups, total = [], 0
     for idx, s in enumerate(sources):
         r = report.get(s["id"], {})
-        nodes = [{"tag": t, "kid": kid_of(k), "renamed": k in s["renames"]}
+        nodes = [{"tag": t, "kid": kid_of(k), "renamed": k in s["renames"],
+                  "share": bool(node_links.get(kid_of(k), {}).get("link"))}
                  for t, k in zip(r.get("tags", []), r.get("keys", []))]
         total += r.get("count", 0)
         groups.append({"id": s["id"], "name": s["name"], "label": source_label(s, idx), "urls": s["urls"],
@@ -1726,6 +1752,22 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return self._json(401, {"error": "未登录"})
         if path == "/admin/api/state":
             return self._json(200, web_state())
+        if path in ("/admin/api/node/link", "/admin/api/node/qr"):
+            kid = query.get("kid", [""])[0]
+            info = read_json(OUT_DIR + "/node_links.json", None)
+            if info is None:
+                return self._json(404, {"error": "还没有生成节点链接，请先点击「立即刷新」"})
+            item = info.get(kid) if re.fullmatch(r"[0-9a-f]{12}", kid) else None
+            if not item:
+                return self._json(404, {"error": "找不到这个节点，请刷新页面后重试"})
+            if not item.get("link"):
+                return self._json(404, {"error": item.get("reason") or "这个节点没有标准的分享链接"})
+            if path.endswith("/link"):
+                return self._json(200, {"tag": item["tag"], "link": item["link"]})
+            svg = qr_svg(item["link"])
+            if svg is None:
+                return self._json(501, {"error": "服务器没有二维码工具。请在服务器运行 msub 选择「订阅二维码」自动安装，或执行 apt install qrencode"})
+            return self._send(200, svg, "image/svg+xml; charset=utf-8")
         if path == "/admin/api/qr":
             items = url_list(load_cfg())
             try:
@@ -2021,6 +2063,7 @@ button{font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--ac
 button.ghost{background:transparent;color:var(--accent)}
 button.danger{background:transparent;color:var(--danger);border-color:var(--danger)}
 button.small{padding:3px 9px;font-size:13px}
+.btns{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 button:disabled{opacity:.6;cursor:default}
 .tab{background:transparent;color:var(--text);border-color:var(--border)}
 .tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -2213,12 +2256,13 @@ details summary{cursor:pointer;margin:8px 0}
     } else { fallback(); }
   }
 
-  function showQr(i, title) {
+  function showQr(i, title) { showQrUrl("/admin/api/qr?kind=" + i, title); }
+  function showQrUrl(url, title) {
     $("qrTitle").textContent = title;
     $("qrMsg").textContent = "加载中…";
     $("qrImg").removeAttribute("src");
     $("qrBox").hidden = false;
-    fetch("/admin/api/qr?kind=" + i, { credentials: "same-origin" }).then(function (r) {
+    fetch(url, { credentials: "same-origin" }).then(function (r) {
       var ct = r.headers.get("Content-Type") || "";
       if (ct.indexOf("svg") >= 0) {
         return r.text().then(function (svg) {
@@ -2261,6 +2305,12 @@ details summary{cursor:pointer;margin:8px 0}
     if (!window.confirm("确定删除节点组「" + g.label + "」及其所有节点吗？")) { return; }
     api("POST", "group/delete", { id: g.id }).then(function () { toast("已删除"); return loadState(); }).catch(fail);
   }
+  function copyNodeLink(n) {
+    api("GET", "node/link?kid=" + encodeURIComponent(n.kid)).then(function (j) { copyText(j.link); }).catch(fail);
+  }
+  function showNodeQr(n) {
+    showQrUrl("/admin/api/node/qr?kid=" + encodeURIComponent(n.kid), n.tag);
+  }
   function renameNode(g, n) {
     var v = window.prompt("新的节点名称（留空 = 恢复默认名称）", n.tag);
     if (v === null) { return; }
@@ -2289,7 +2339,12 @@ details summary{cursor:pointer;margin:8px 0}
       g.nodes.forEach(function (n) {
         det.appendChild(el("div", { "class": "row spread node" }, [
           el("span", { text: n.tag + (n.renamed ? "  ✎" : "") }),
-          el("button", { "class": "ghost small", text: "改名", onclick: function () { renameNode(g, n); } })
+          el("span", { "class": "btns" }, [
+            n.share ? el("button", { "class": "ghost small", text: "链接", onclick: function () { copyNodeLink(n); } }) : null,
+            n.share ? el("button", { "class": "ghost small", text: "二维码", onclick: function () { showNodeQr(n); } }) : null,
+            n.share ? null : el("span", { "class": "muted small", text: "仅订阅可用" }),
+            el("button", { "class": "ghost small", text: "改名", onclick: function () { renameNode(g, n); } })
+          ])
         ]));
       });
       card.appendChild(det);
@@ -3872,6 +3927,9 @@ def selftest():
         st, b = call("GET", "/admin/api/state")
         stt = json.loads(b.decode("utf-8"))
         check("读取状态", stt.get("nodes") == 1 and stt.get("ready"))
+        node = stt["groups"][0]["nodes"][0]
+        st, b = call("GET", "/admin/api/node/link?kid=" + node["kid"])
+        check("单个节点分享链接可获取", st == 200 and json.loads(b.decode("utf-8"))["link"].startswith("ss://"))
         kinds = [("通用订阅", "ss://"), ("sing-box 全局", '"outbounds"'), ("sing-box 分流", "rule_set"), ("Clash", "proxies:")]
         for i, (label, needle) in enumerate(kinds):
             with op.open(stt["links"][i]["url"], timeout=20) as r:
